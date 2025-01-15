@@ -16,6 +16,7 @@ use turbopack_core::{
     environment::Environment,
     ident::AssetIdent,
     module::Module,
+    module_graph::ModuleGraph,
     output::{OutputAsset, OutputAssets},
 };
 use turbopack_ecmascript::{
@@ -293,9 +294,10 @@ impl ChunkingContext for NodeJsChunkingContext {
 
     #[turbo_tasks::function]
     async fn chunk_group(
-        self: Vc<Self>,
+        self: ResolvedVc<Self>,
         _ident: Vc<AssetIdent>,
         module: ResolvedVc<Box<dyn ChunkableModule>>,
+        module_graph: Vc<ModuleGraph>,
         availability_info: Value<AvailabilityInfo>,
     ) -> Result<Vc<ChunkGroupResult>> {
         let span = tracing::info_span!(
@@ -307,8 +309,9 @@ impl ChunkingContext for NodeJsChunkingContext {
                 chunks,
                 availability_info,
             } = make_chunk_group(
-                Vc::upcast(self),
                 [ResolvedVc::upcast(module)],
+                module_graph,
+                ResolvedVc::upcast(self),
                 availability_info.into_value(),
             )
             .await?;
@@ -334,10 +337,11 @@ impl ChunkingContext for NodeJsChunkingContext {
     /// * exports the result of evaluating the given module as a CommonJS default export.
     #[turbo_tasks::function]
     pub async fn entry_chunk_group(
-        self: Vc<Self>,
+        self: ResolvedVc<Self>,
         path: Vc<FileSystemPath>,
         module: ResolvedVc<Box<dyn Module>>,
         evaluatable_assets: Vc<EvaluatableAssets>,
+        module_graph: Vc<ModuleGraph>,
         extra_chunks: Vc<OutputAssets>,
         availability_info: Value<AvailabilityInfo>,
     ) -> Result<Vc<EntryChunkGroupResult>> {
@@ -347,13 +351,14 @@ impl ChunkingContext for NodeJsChunkingContext {
             chunks,
             availability_info,
         } = make_chunk_group(
-            Vc::upcast(self),
             once(module).chain(
                 evaluatable_assets
                     .await?
                     .iter()
                     .map(|&asset| ResolvedVc::upcast(asset)),
             ),
+            module_graph,
+            ResolvedVc::upcast(self),
             availability_info,
         )
         .await?;
@@ -378,10 +383,11 @@ impl ChunkingContext for NodeJsChunkingContext {
         let asset = ResolvedVc::upcast(
             EcmascriptBuildNodeEntryChunk::new(
                 path,
-                self,
                 Vc::cell(other_chunks),
                 evaluatable_assets,
                 *module,
+                module_graph,
+                *self,
             )
             .to_resolved()
             .await?,
@@ -399,6 +405,7 @@ impl ChunkingContext for NodeJsChunkingContext {
         self: Vc<Self>,
         _ident: Vc<AssetIdent>,
         _evaluatable_assets: Vc<EvaluatableAssets>,
+        _module_graph: Vc<ModuleGraph>,
         _availability_info: Value<AvailabilityInfo>,
     ) -> Result<Vc<ChunkGroupResult>> {
         // TODO(alexkirsz) This method should be part of a separate trait that is
@@ -415,18 +422,20 @@ impl ChunkingContext for NodeJsChunkingContext {
     async fn async_loader_chunk_item(
         self: Vc<Self>,
         module: Vc<Box<dyn ChunkableModule>>,
+        module_graph: Vc<ModuleGraph>,
         availability_info: Value<AvailabilityInfo>,
     ) -> Result<Vc<Box<dyn ChunkItem>>> {
         Ok(if self.await?.manifest_chunks {
             let manifest_asset =
-                ManifestAsyncModule::new(module, Vc::upcast(self), availability_info);
+                ManifestAsyncModule::new(module, module_graph, Vc::upcast(self), availability_info);
             Vc::upcast(ManifestLoaderChunkItem::new(
                 manifest_asset,
+                module_graph,
                 Vc::upcast(self),
             ))
         } else {
             let module = AsyncLoaderModule::new(module, Vc::upcast(self), availability_info);
-            Vc::upcast(module.as_chunk_item(Vc::upcast(self)))
+            Vc::upcast(module.as_chunk_item(module_graph, Vc::upcast(self)))
         })
     }
 
