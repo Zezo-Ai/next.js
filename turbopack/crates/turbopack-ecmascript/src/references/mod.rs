@@ -7,6 +7,7 @@ pub mod dynamic_expression;
 pub mod esm;
 pub mod external_module;
 pub mod ident;
+pub mod member;
 pub mod node;
 pub mod pattern_mapping;
 pub mod raw;
@@ -17,21 +18,17 @@ pub mod unreachable;
 pub mod util;
 pub mod worker;
 
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, HashMap},
-    mem::take,
-    sync::Arc,
-};
+use std::{borrow::Cow, collections::BTreeMap, mem::take, ops::Deref, sync::Arc};
 
 use anyhow::{bail, Result};
-use constant_condition::{ConstantCondition, ConstantConditionValue};
-use constant_value::ConstantValue;
+use constant_condition::{ConstantConditionCodeGen, ConstantConditionValue};
+use constant_value::ConstantValueCodeGen;
 use lazy_static::lazy_static;
 use num_traits::Zero;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use regex::Regex;
+use rustc_hash::FxHashMap;
 use sourcemap::decode_data_url;
 use swc_core::{
     atoms::JsWord,
@@ -89,8 +86,8 @@ use self::{
     },
     cjs::CjsAssetReference,
     esm::{
-        binding::EsmBindings, export::EsmExport, EsmAssetReference, EsmAsyncAssetReference,
-        EsmExports, EsmModuleItem, ImportMetaBinding, ImportMetaRef, UrlAssetReference,
+        export::EsmExport, EsmAssetReference, EsmAsyncAssetReference, EsmExports, EsmModuleItem,
+        ImportMetaBinding, ImportMetaRef, UrlAssetReference,
     },
     node::DirAssetReference,
     raw::FileSourceReference,
@@ -126,7 +123,7 @@ use crate::{
         ConstantNumber, ConstantString, JsValueUrlKind, RequireContextValue,
     },
     chunk::EcmascriptExports,
-    code_gen::{CodeGen, CodeGenerateable, CodeGenerateableWithAsyncModuleInfo, CodeGenerateables},
+    code_gen::{CodeGen, CodeGens},
     magic_identifier,
     parse::parse,
     references::{
@@ -135,9 +132,14 @@ use crate::{
         dynamic_expression::DynamicExpression,
         esm::{module_id::EsmModuleIdAssetReference, EsmBinding, UrlRewriteBehavior},
         ident::IdentReplacement,
+        member::MemberReplacement,
         node::PackageJsonReference,
         require_context::{RequireContextAssetReference, RequireContextMap},
         type_issue::SpecifiedModuleTypeIssue,
+    },
+    runtime_functions::{
+        TUBROPACK_RUNTIME_FUNCTION_SHORTCUTS, TURBOPACK_EXPORT_NAMESPACE, TURBOPACK_EXPORT_VALUE,
+        TURBOPACK_REQUIRE_REAL, TURBOPACK_REQUIRE_STUB,
     },
     tree_shake::{find_turbopack_part_id_in_asserts, part_of_module, split},
     utils::{module_value_to_well_known_object, AstPathRange},
@@ -152,7 +154,7 @@ pub struct AnalyzeEcmascriptModuleResult {
     pub local_references: ResolvedVc<ModuleReferences>,
     pub reexport_references: ResolvedVc<ModuleReferences>,
     pub evaluation_references: ResolvedVc<ModuleReferences>,
-    pub code_generation: ResolvedVc<CodeGenerateables>,
+    pub code_generation: ResolvedVc<CodeGens>,
     pub exports: ResolvedVc<EcmascriptExports>,
     pub async_module: ResolvedVc<OptionAsyncModule>,
     /// `true` when the analysis was successful.
@@ -172,7 +174,6 @@ pub struct AnalyzeEcmascriptModuleResultBuilder {
     async_module: ResolvedVc<OptionAsyncModule>,
     successful: bool,
     source_map: Option<ResolvedVc<OptionSourceMap>>,
-    bindings: Vec<EsmBinding>,
 }
 
 impl AnalyzeEcmascriptModuleResultBuilder {
@@ -187,7 +188,6 @@ impl AnalyzeEcmascriptModuleResultBuilder {
             async_module: ResolvedVc::cell(None),
             successful: false,
             source_map: None,
-            bindings: Vec::new(),
         }
     }
 
@@ -230,28 +230,11 @@ impl AnalyzeEcmascriptModuleResultBuilder {
     }
 
     /// Adds a codegen to the analysis result.
-    pub fn add_code_gen<C>(&mut self, code_gen: Vc<C>)
+    pub fn add_code_gen<C>(&mut self, code_gen: C)
     where
-        C: Upcast<Box<dyn CodeGenerateable>>,
+        C: Into<CodeGen>,
     {
-        self.code_gens
-            .push(CodeGen::CodeGenerateable(Vc::upcast(code_gen)));
-    }
-
-    /// Adds a codegen to the analysis result.
-    #[allow(dead_code)]
-    pub fn add_code_gen_with_availability_info<C>(&mut self, code_gen: ResolvedVc<C>)
-    where
-        C: Upcast<Box<dyn CodeGenerateableWithAsyncModuleInfo>>,
-    {
-        self.code_gens
-            .push(CodeGen::CodeGenerateableWithAsyncModuleInfo(
-                ResolvedVc::upcast(code_gen),
-            ));
-    }
-
-    pub fn add_binding(&mut self, binding: EsmBinding) {
-        self.bindings.push(binding);
+        self.code_gens.push(code_gen.into())
     }
 
     /// Sets the analysis result ES export.
@@ -274,17 +257,11 @@ impl AnalyzeEcmascriptModuleResultBuilder {
         self.successful = successful;
     }
 
-    /// Builds the final analysis result. Resolves internal Vcs for performance
-    /// in using them.
+    /// Builds the final analysis result. Resolves internal Vcs.
     pub async fn build(
-        mut self,
+        self,
         track_reexport_references: bool,
     ) -> Result<Vc<AnalyzeEcmascriptModuleResult>> {
-        let bindings = EsmBindings::new(take(&mut self.bindings));
-        if !bindings.await?.bindings.is_empty() {
-            self.add_code_gen(bindings);
-        }
-
         let references = self.references.into_iter().collect();
         let local_references: Vec<_> = track_reexport_references
             .then(|| self.local_references.into_iter())
@@ -301,14 +278,6 @@ impl AnalyzeEcmascriptModuleResultBuilder {
             .into_iter()
             .flatten()
             .collect();
-        for c in self.code_gens.iter_mut() {
-            match c {
-                CodeGen::CodeGenerateable(c) => {
-                    *c = c.resolve().await?;
-                }
-                CodeGen::CodeGenerateableWithAsyncModuleInfo(..) => {}
-            }
-        }
 
         let source_map = if let Some(source_map) = self.source_map {
             source_map
@@ -345,7 +314,8 @@ struct AnalysisState<'a> {
     var_graph: &'a VarGraph,
     /// This is the current state of known values of function
     /// arguments.
-    fun_args_values: Mutex<HashMap<u32, Vec<JsValue>>>,
+    fun_args_values: Mutex<FxHashMap<u32, Vec<JsValue>>>,
+    var_cache: Mutex<FxHashMap<Id, JsValue>>,
     // There can be many references to import.meta, but only the first should hoist
     // the object allocation.
     first_import_meta: bool,
@@ -358,10 +328,9 @@ struct AnalysisState<'a> {
 impl AnalysisState<'_> {
     /// Links a value to the graph, returning the linked value.
     async fn link_value(&self, value: JsValue, attributes: &ImportAttributes) -> Result<JsValue> {
-        let fun_args_values = self.fun_args_values.lock().clone();
-        link(
+        Ok(link(
             self.var_graph,
-            value.clone(),
+            value,
             &early_value_visitor,
             &|value| {
                 value_visitor(
@@ -372,9 +341,11 @@ impl AnalysisState<'_> {
                     attributes,
                 )
             },
-            fun_args_values,
+            &self.fun_args_values,
+            &self.var_cache,
         )
-        .await
+        .await?
+        .0)
     }
 }
 
@@ -447,24 +418,36 @@ pub(crate) async fn analyse_ecmascript_module_internal(
     } = *module.determine_module_type().await?;
 
     if let Some(package_json) = referenced_package_json {
-        analysis.add_reference(
-            PackageJsonReference::new(*package_json)
-                .to_resolved()
-                .await?,
-        );
+        let span = tracing::info_span!("package.json reference");
+        async {
+            analysis.add_reference(
+                PackageJsonReference::new(*package_json)
+                    .to_resolved()
+                    .await?,
+            );
+            anyhow::Ok(())
+        }
+        .instrument(span)
+        .await?;
     }
 
     if analyze_types {
-        match &*find_context_file(path.parent(), tsconfig()).await? {
-            FindContextFileResult::Found(tsconfig, _) => {
-                analysis.add_reference(
-                    TsConfigReference::new(*origin, **tsconfig)
-                        .to_resolved()
-                        .await?,
-                );
-            }
-            FindContextFileResult::NotFound(_) => {}
-        };
+        let span = tracing::info_span!("tsconfig reference");
+        async {
+            match &*find_context_file(path.parent(), tsconfig()).await? {
+                FindContextFileResult::Found(tsconfig, _) => {
+                    analysis.add_reference(
+                        TsConfigReference::new(*origin, **tsconfig)
+                            .to_resolved()
+                            .await?,
+                    );
+                }
+                FindContextFileResult::NotFound(_) => {}
+            };
+            anyhow::Ok(())
+        }
+        .instrument(span)
+        .await?;
     }
 
     special_cases(&path.await?.path, &mut analysis);
@@ -494,763 +477,842 @@ pub(crate) async fn analyse_ecmascript_module_internal(
 
     let pos = program.span().lo;
     if analyze_types {
-        if let Some(comments) = comments.get_leading(pos) {
-            for comment in comments.iter() {
-                if let CommentKind::Line = comment.kind {
-                    lazy_static! {
-                        static ref REFERENCE_PATH: Regex =
-                            Regex::new(r#"^/\s*<reference\s*path\s*=\s*["'](.+)["']\s*/>\s*$"#)
-                                .unwrap();
-                        static ref REFERENCE_TYPES: Regex =
-                            Regex::new(r#"^/\s*<reference\s*types\s*=\s*["'](.+)["']\s*/>\s*$"#)
-                                .unwrap();
-                    }
-                    let text = &comment.text;
-                    if let Some(m) = REFERENCE_PATH.captures(text) {
-                        let path = &m[1];
-                        analysis.add_reference(
-                            TsReferencePathAssetReference::new(*origin, path.into())
-                                .to_resolved()
-                                .await?,
-                        );
-                    } else if let Some(m) = REFERENCE_TYPES.captures(text) {
-                        let types = &m[1];
-                        analysis.add_reference(
-                            TsReferenceTypeAssetReference::new(*origin, types.into())
-                                .to_resolved()
-                                .await?,
-                        );
+        let span = tracing::info_span!("type references");
+        async {
+            if let Some(comments) = comments.get_leading(pos) {
+                for comment in comments.iter() {
+                    if let CommentKind::Line = comment.kind {
+                        lazy_static! {
+                            static ref REFERENCE_PATH: Regex =
+                                Regex::new(r#"^/\s*<reference\s*path\s*=\s*["'](.+)["']\s*/>\s*$"#)
+                                    .unwrap();
+                            static ref REFERENCE_TYPES: Regex = Regex::new(
+                                r#"^/\s*<reference\s*types\s*=\s*["'](.+)["']\s*/>\s*$"#
+                            )
+                            .unwrap();
+                        }
+                        let text = &comment.text;
+                        if let Some(m) = REFERENCE_PATH.captures(text) {
+                            let path = &m[1];
+                            analysis.add_reference(
+                                TsReferencePathAssetReference::new(*origin, path.into())
+                                    .to_resolved()
+                                    .await?,
+                            );
+                        } else if let Some(m) = REFERENCE_TYPES.captures(text) {
+                            let types = &m[1];
+                            analysis.add_reference(
+                                TsReferenceTypeAssetReference::new(*origin, types.into())
+                                    .to_resolved()
+                                    .await?,
+                            );
+                        }
                     }
                 }
             }
+            anyhow::Ok(())
         }
+        .instrument(span)
+        .await?;
     }
 
-    // Only use the last sourceMappingURL comment by spec
-    let mut paths_by_pos = Vec::new();
-    for (pos, comments) in comments.trailing.iter() {
-        for comment in comments.iter().rev() {
-            lazy_static! {
-                static ref SOURCE_MAP_FILE_REFERENCE: Regex =
-                    Regex::new(r"# sourceMappingURL=(.*)$").unwrap();
+    if options.extract_source_map {
+        let span = tracing::info_span!("source map reference");
+        async {
+            // Only use the last sourceMappingURL comment by spec
+            let mut paths_by_pos = Vec::new();
+            for (pos, comments) in comments.trailing.iter() {
+                for comment in comments.iter().rev() {
+                    lazy_static! {
+                        static ref SOURCE_MAP_FILE_REFERENCE: Regex =
+                            Regex::new(r"# sourceMappingURL=(.*)$").unwrap();
+                    }
+                    if let Some(m) = SOURCE_MAP_FILE_REFERENCE.captures(&comment.text) {
+                        let path = m.get(1).unwrap().as_str();
+                        paths_by_pos.push((pos, path));
+                        break;
+                    }
+                }
             }
-            if let Some(m) = SOURCE_MAP_FILE_REFERENCE.captures(&comment.text) {
-                let path = m.get(1).unwrap().as_str();
-                paths_by_pos.push((pos, path));
-                break;
+
+            // TODO This is too eagerly generating the source map. We should store a
+            // GenerateSourceMap instead and only actually generate the SourceMap when
+            // it's needed. This would allow to avoid generating the source map when a
+            // module is never included in the final bundle. It allows analysis to
+            // finish earlier which makes references available earlier which benefits
+            // parallelism. When SourceMaps are emitted it moves that generation work to
+            // the code generation phase which is more parallelizable.
+            let mut source_map_from_comment = false;
+            if let Some((_, path)) = paths_by_pos.into_iter().max_by_key(|&(pos, _)| pos) {
+                let origin_path = origin.origin_path();
+                if path.ends_with(".map") {
+                    let source_map_origin = origin_path.parent().join(path.into());
+                    let reference = SourceMapReference::new(origin_path, source_map_origin)
+                        .to_resolved()
+                        .await?;
+                    analysis.add_reference(reference);
+                    let source_map = reference.generate_source_map();
+                    analysis.set_source_map(
+                        convert_to_turbopack_source_map(source_map, source_map_origin)
+                            .to_resolved()
+                            .await?,
+                    );
+                    source_map_from_comment = true;
+                } else if path.starts_with("data:application/json;base64,") {
+                    let source_map_origin = origin_path;
+                    let source_map = maybe_decode_data_url(path.into());
+                    analysis.set_source_map(
+                        convert_to_turbopack_source_map(source_map, source_map_origin)
+                            .to_resolved()
+                            .await?,
+                    );
+                    source_map_from_comment = true;
+                }
             }
+            if !source_map_from_comment {
+                if let Some(generate_source_map) =
+                    ResolvedVc::try_sidecast::<Box<dyn GenerateSourceMap>>(source)
+                {
+                    let source_map_origin = source.ident().path();
+                    analysis.set_source_map(
+                        convert_to_turbopack_source_map(
+                            generate_source_map.generate_source_map(),
+                            source_map_origin,
+                        )
+                        .to_resolved()
+                        .await?,
+                    );
+                }
+            }
+            anyhow::Ok(())
         }
-    }
-    // TODO This is too eagerly generating the source map. We should store a GenerateSourceMap
-    // instead and only actually generate the SourceMap when it's needed. This would allow to avoid
-    // generating the source map when a module is never included in the final bundle. It allows
-    // analysis to finish earlier which makes references available earlier which benefits
-    // parallelism. When SourceMaps are emitted it moves that generation work to the code generation
-    // phase which is more parallelizable.
-    let mut source_map_from_comment = false;
-    if let Some((_, path)) = paths_by_pos.into_iter().max_by_key(|&(pos, _)| pos) {
-        let origin_path = origin.origin_path();
-        if path.ends_with(".map") {
-            let source_map_origin = origin_path.parent().join(path.into());
-            let reference = SourceMapReference::new(origin_path, source_map_origin)
-                .to_resolved()
-                .await?;
-            analysis.add_reference(reference);
-            let source_map = reference.generate_source_map();
-            analysis.set_source_map(
-                convert_to_turbopack_source_map(source_map, source_map_origin)
-                    .to_resolved()
-                    .await?,
-            );
-            source_map_from_comment = true;
-        } else if path.starts_with("data:application/json;base64,") {
-            let source_map_origin = origin_path;
-            let source_map = maybe_decode_data_url(path.into());
-            analysis.set_source_map(
-                convert_to_turbopack_source_map(source_map, source_map_origin)
-                    .to_resolved()
-                    .await?,
-            );
-            source_map_from_comment = true;
-        }
-    }
-    if !source_map_from_comment {
-        if let Some(generate_source_map) =
-            ResolvedVc::try_sidecast::<Box<dyn GenerateSourceMap>>(source).await?
-        {
-            let source_map_origin = source.ident().path();
-            analysis.set_source_map(
-                convert_to_turbopack_source_map(
-                    generate_source_map.generate_source_map(),
-                    source_map_origin,
-                )
-                .to_resolved()
-                .await?,
-            );
-        }
+        .instrument(span)
+        .await?;
     }
 
     let (emitter, collector) = IssueEmitter::new(source, source_map.clone(), None);
     let handler = Handler::with_emitter(true, false, Box::new(emitter));
 
-    let mut var_graph =
-        set_handler_and_globals(&handler, globals, || create_graph(program, eval_context));
+    let mut var_graph = {
+        let _span = tracing::info_span!("analyze variable values");
+        set_handler_and_globals(&handler, globals, || create_graph(program, eval_context))
+    };
 
     let mut evaluation_references = Vec::new();
 
-    // ast-grep-ignore: to-resolved-in-loop
-    for (i, r) in eval_context.imports.references().enumerate() {
-        let r = EsmAssetReference::new(
-            *origin,
-            Request::parse(Value::new(RcStr::from(&*r.module_path).into())),
-            r.issue_source
-                .unwrap_or_else(|| IssueSource::from_source_only(*source)),
-            Value::new(r.annotations.clone()),
-            match options.tree_shaking_mode {
-                Some(TreeShakingMode::ModuleFragments) => match &r.imported_symbol {
-                    ImportedSymbol::ModuleEvaluation => {
+    let span = tracing::info_span!("esm import references");
+    async {
+        for (i, r) in eval_context.imports.references().enumerate() {
+            let r = EsmAssetReference::new(
+                origin,
+                Request::parse(Value::new(RcStr::from(&*r.module_path).into()))
+                    .to_resolved()
+                    .await?,
+                r.issue_source
+                    .clone()
+                    .unwrap_or_else(|| IssueSource::from_source_only(source)),
+                Value::new(r.annotations.clone()),
+                match options.tree_shaking_mode {
+                    Some(TreeShakingMode::ModuleFragments) => match &r.imported_symbol {
+                        ImportedSymbol::ModuleEvaluation => {
+                            evaluation_references.push(i);
+                            Some(ModulePart::evaluation().to_resolved().await?)
+                        }
+                        ImportedSymbol::Symbol(name) => {
+                            Some(ModulePart::export((&**name).into()).to_resolved().await?)
+                        }
+                        ImportedSymbol::PartEvaluation(part_id) => {
+                            evaluation_references.push(i);
+                            Some(
+                                ModulePart::internal_evaluation(*part_id)
+                                    .to_resolved()
+                                    .await?,
+                            )
+                        }
+                        ImportedSymbol::Part(part_id) => {
+                            Some(ModulePart::internal(*part_id).to_resolved().await?)
+                        }
+                        ImportedSymbol::Exports => Some(ModulePart::exports().to_resolved().await?),
+                    },
+                    Some(TreeShakingMode::ReexportsOnly) => match &r.imported_symbol {
+                        ImportedSymbol::ModuleEvaluation => {
+                            evaluation_references.push(i);
+                            Some(ModulePart::evaluation().to_resolved().await?)
+                        }
+                        ImportedSymbol::Symbol(name) => {
+                            Some(ModulePart::export((&**name).into()).to_resolved().await?)
+                        }
+                        ImportedSymbol::PartEvaluation(_) | ImportedSymbol::Part(_) => {
+                            bail!("Internal imports doesn't exist in reexports only mode")
+                        }
+                        ImportedSymbol::Exports => None,
+                    },
+                    None => {
                         evaluation_references.push(i);
-                        Some(ModulePart::evaluation())
+                        None
                     }
-                    ImportedSymbol::Symbol(name) => Some(ModulePart::export((&**name).into())),
-                    ImportedSymbol::PartEvaluation(part_id) => {
-                        evaluation_references.push(i);
-                        Some(ModulePart::internal_evaluation(*part_id))
-                    }
-                    ImportedSymbol::Part(part_id) => Some(ModulePart::internal(*part_id)),
-                    ImportedSymbol::Exports => Some(ModulePart::exports()),
                 },
-                Some(TreeShakingMode::ReexportsOnly) => match &r.imported_symbol {
-                    ImportedSymbol::ModuleEvaluation => {
-                        evaluation_references.push(i);
-                        Some(ModulePart::evaluation())
-                    }
-                    ImportedSymbol::Symbol(name) => Some(ModulePart::export((&**name).into())),
-                    ImportedSymbol::PartEvaluation(_) | ImportedSymbol::Part(_) => {
-                        bail!("Internal imports doesn't exist in reexports only mode")
-                    }
-                    ImportedSymbol::Exports => None,
-                },
-                None => {
-                    evaluation_references.push(i);
-                    None
-                }
-            },
-            import_externals,
-        )
-        .to_resolved()
-        .await?;
-
-        import_references.push(r);
-    }
-
-    for i in evaluation_references {
-        let reference = import_references[i];
-        analysis.add_evaluation_reference(reference);
-        analysis.add_import_reference(reference);
-    }
-
-    let (webpack_runtime, webpack_entry, webpack_chunks, esm_exports, esm_star_exports) =
-        set_handler_and_globals(&handler, globals, || {
-            // TODO migrate to effects
-            let import_references: Vec<_> = import_references.iter().map(|&rvc| *rvc).collect(); // TODO(ResolvedVc): reinterpret directly
-            let mut visitor =
-                ModuleReferencesVisitor::new(eval_context, &import_references, &mut analysis);
-
-            for (i, reexport) in eval_context.imports.reexports() {
-                let import_ref = import_references[i];
-                match reexport {
-                    Reexport::Star => {
-                        visitor.esm_star_exports.push(Vc::upcast(import_ref));
-                    }
-                    Reexport::Namespace { exported: n } => {
-                        visitor.esm_exports.insert(
-                            n.as_str().into(),
-                            EsmExport::ImportedNamespace(Vc::upcast(import_ref)),
-                        );
-                    }
-                    Reexport::Named {
-                        imported: i,
-                        exported: e,
-                    } => {
-                        visitor.esm_exports.insert(
-                            e.as_str().into(),
-                            EsmExport::ImportedBinding(
-                                Vc::upcast(import_ref),
-                                i.to_string().into(),
-                                false,
-                            ),
-                        );
-                    }
-                }
-            }
-
-            program.visit_with_ast_path(&mut visitor, &mut Default::default());
-
-            (
-                visitor.webpack_runtime,
-                visitor.webpack_entry,
-                visitor.webpack_chunks,
-                visitor.esm_exports,
-                visitor.esm_star_exports,
+                import_externals,
             )
-        });
+            .to_resolved()
+            .await?;
 
-    for export in esm_exports.values() {
-        match *export {
-            EsmExport::LocalBinding(..) => {}
-            EsmExport::ImportedNamespace(reference) => {
-                let reference = reference.to_resolved().await?;
-                analysis.add_reexport_reference(reference);
-                analysis.add_import_reference(reference);
-            }
-            EsmExport::ImportedBinding(reference, ..) => {
-                let reference = reference.to_resolved().await?;
-                analysis.add_reexport_reference(reference);
-                analysis.add_import_reference(reference);
-            }
-            EsmExport::Error => {}
+            import_references.push(r);
         }
-    }
-    for reference in esm_star_exports
-        .iter()
-        .map(|r| r.to_resolved())
-        .try_join()
-        .await?
-    {
-        analysis.add_reexport_reference(reference);
-        analysis.add_import_reference(reference);
-    }
+        for i in evaluation_references {
+            let reference = import_references[i];
+            analysis.add_evaluation_reference(reference);
+            analysis.add_import_reference(reference);
+        }
 
-    let mut ignore_effect_span = None;
-    // Check if it was a webpack entry
-    if let Some((request, span)) = webpack_runtime {
-        let request = Request::parse(Value::new(request.into()))
-            .to_resolved()
-            .await?;
-        let runtime = resolve_as_webpack_runtime(*origin, *request, *transforms)
-            .to_resolved()
-            .await?;
+        anyhow::Ok(())
+    }
+    .instrument(span)
+    .await?;
 
-        if let WebpackRuntime::Webpack5 { .. } = &*runtime.await? {
-            ignore_effect_span = Some(span);
-            analysis.add_reference(
-                WebpackRuntimeAssetReference {
-                    origin,
-                    request,
-                    runtime,
-                    transforms,
+    let span = tracing::info_span!("exports");
+    let (webpack_runtime, webpack_entry, webpack_chunks) = async {
+        let (webpack_runtime, webpack_entry, webpack_chunks, esm_exports, esm_star_exports) =
+            set_handler_and_globals(&handler, globals, || {
+                // TODO migrate to effects
+                let mut visitor =
+                    ModuleReferencesVisitor::new(eval_context, &import_references, &mut analysis);
+
+                for (i, reexport) in eval_context.imports.reexports() {
+                    let import_ref = import_references[i];
+                    match reexport {
+                        Reexport::Star => {
+                            visitor
+                                .esm_star_exports
+                                .push(ResolvedVc::upcast(import_ref));
+                        }
+                        Reexport::Namespace { exported: n } => {
+                            visitor.esm_exports.insert(
+                                n.as_str().into(),
+                                EsmExport::ImportedNamespace(ResolvedVc::upcast(import_ref)),
+                            );
+                        }
+                        Reexport::Named {
+                            imported: i,
+                            exported: e,
+                        } => {
+                            visitor.esm_exports.insert(
+                                e.as_str().into(),
+                                EsmExport::ImportedBinding(
+                                    ResolvedVc::upcast(import_ref),
+                                    i.to_string().into(),
+                                    false,
+                                ),
+                            );
+                        }
+                    }
                 }
-                .resolved_cell(),
-            );
 
-            if webpack_entry {
-                analysis.add_reference(
-                    WebpackEntryAssetReference {
-                        source,
-                        runtime,
-                        transforms,
-                    }
-                    .resolved_cell(),
-                );
-            }
+                program.visit_with_ast_path(&mut visitor, &mut Default::default());
 
-            for chunk in webpack_chunks {
-                analysis.add_reference(
-                    WebpackChunkAssetReference {
-                        chunk_id: chunk,
-                        runtime,
-                        transforms,
-                    }
-                    .resolved_cell(),
-                );
+                (
+                    visitor.webpack_runtime,
+                    visitor.webpack_entry,
+                    visitor.webpack_chunks,
+                    visitor.esm_exports,
+                    visitor.esm_star_exports,
+                )
+            });
+
+        for export in esm_exports.values() {
+            match *export {
+                EsmExport::LocalBinding(..) => {}
+                EsmExport::ImportedNamespace(reference) => {
+                    analysis.add_reexport_reference(reference);
+                    analysis.add_import_reference(reference);
+                }
+                EsmExport::ImportedBinding(reference, ..) => {
+                    analysis.add_reexport_reference(reference);
+                    analysis.add_import_reference(reference);
+                }
+                EsmExport::Error => {}
             }
         }
-    }
-
-    let exports = if !esm_exports.is_empty() || !esm_star_exports.is_empty() {
-        if specified_type == SpecifiedModuleType::CommonJs {
-            SpecifiedModuleTypeIssue {
-                path: source.ident().path().to_resolved().await?,
-                specified_type,
-            }
-            .resolved_cell()
-            .emit();
+        for reference in &esm_star_exports {
+            analysis.add_reexport_reference(*reference);
+            analysis.add_import_reference(*reference);
         }
-
-        let esm_exports = EsmExports {
-            exports: esm_exports,
-            star_exports: esm_star_exports
-                .into_iter()
-                .map(|v| v.to_resolved())
-                .try_join()
-                .await?,
-        }
-        .cell();
-
-        EcmascriptExports::EsmExports(esm_exports.to_resolved().await?)
-    } else if specified_type == SpecifiedModuleType::EcmaScript {
-        match detect_dynamic_export(program) {
-            DetectedDynamicExportType::CommonJs => {
+        let exports = if !esm_exports.is_empty() || !esm_star_exports.is_empty() {
+            if specified_type == SpecifiedModuleType::CommonJs {
                 SpecifiedModuleTypeIssue {
                     path: source.ident().path().to_resolved().await?,
                     specified_type,
                 }
                 .resolved_cell()
                 .emit();
+            }
 
-                EcmascriptExports::EsmExports(
+            let esm_exports = EsmExports {
+                exports: esm_exports,
+                star_exports: esm_star_exports,
+            }
+            .cell();
+
+            EcmascriptExports::EsmExports(esm_exports.to_resolved().await?)
+        } else if specified_type == SpecifiedModuleType::EcmaScript {
+            match detect_dynamic_export(program) {
+                DetectedDynamicExportType::CommonJs => {
+                    SpecifiedModuleTypeIssue {
+                        path: source.ident().path().to_resolved().await?,
+                        specified_type,
+                    }
+                    .resolved_cell()
+                    .emit();
+
+                    EcmascriptExports::EsmExports(
+                        EsmExports {
+                            exports: Default::default(),
+                            star_exports: Default::default(),
+                        }
+                        .resolved_cell(),
+                    )
+                }
+                DetectedDynamicExportType::Namespace => EcmascriptExports::DynamicNamespace,
+                DetectedDynamicExportType::Value => EcmascriptExports::Value,
+                DetectedDynamicExportType::UsingModuleDeclarations
+                | DetectedDynamicExportType::None => EcmascriptExports::EsmExports(
                     EsmExports {
                         exports: Default::default(),
                         star_exports: Default::default(),
                     }
                     .resolved_cell(),
-                )
+                ),
             }
-            DetectedDynamicExportType::Namespace => EcmascriptExports::DynamicNamespace,
-            DetectedDynamicExportType::Value => EcmascriptExports::Value,
-            DetectedDynamicExportType::UsingModuleDeclarations
-            | DetectedDynamicExportType::None => EcmascriptExports::EsmExports(
-                EsmExports {
-                    exports: Default::default(),
-                    star_exports: Default::default(),
+        } else {
+            match detect_dynamic_export(program) {
+                DetectedDynamicExportType::CommonJs => EcmascriptExports::CommonJs,
+                DetectedDynamicExportType::Namespace => EcmascriptExports::DynamicNamespace,
+                DetectedDynamicExportType::Value => EcmascriptExports::Value,
+                DetectedDynamicExportType::UsingModuleDeclarations => {
+                    EcmascriptExports::EsmExports(
+                        EsmExports {
+                            exports: Default::default(),
+                            star_exports: Default::default(),
+                        }
+                        .resolved_cell(),
+                    )
                 }
-                .resolved_cell(),
-            ),
-        }
-    } else {
-        match detect_dynamic_export(program) {
-            DetectedDynamicExportType::CommonJs => EcmascriptExports::CommonJs,
-            DetectedDynamicExportType::Namespace => EcmascriptExports::DynamicNamespace,
-            DetectedDynamicExportType::Value => EcmascriptExports::Value,
-            DetectedDynamicExportType::UsingModuleDeclarations => EcmascriptExports::EsmExports(
-                EsmExports {
-                    exports: Default::default(),
-                    star_exports: Default::default(),
-                }
-                .resolved_cell(),
-            ),
-            DetectedDynamicExportType::None => EcmascriptExports::EmptyCommonJs,
-        }
-    };
-
-    let top_level_await_span =
-        set_handler_and_globals(&handler, globals, || has_top_level_await(program));
-    let has_top_level_await = top_level_await_span.is_some();
-
-    if eval_context.is_esm(specified_type) {
-        let async_module = AsyncModule {
-            has_top_level_await,
-            import_externals,
-        }
-        .resolved_cell();
-        analysis.set_async_module(async_module);
-    } else if let Some(span) = top_level_await_span {
-        AnalyzeIssue::new(
-            IssueSeverity::Error.cell(),
-            source.ident(),
-            Vc::cell("unexpected top level await".into()),
-            StyledString::Text("top level await is only supported in ESM modules.".into()).cell(),
-            None,
-            Some(issue_source(*source, span)),
-        )
-        .to_resolved()
-        .await?
-        .emit();
-    }
-
-    analysis.set_exports(exports);
-
-    let effects = take(&mut var_graph.effects);
-
-    let mut analysis_state = AnalysisState {
-        handler: &handler,
-        source,
-        origin,
-        compile_time_info,
-        var_graph: &var_graph,
-        fun_args_values: Mutex::new(HashMap::<u32, Vec<JsValue>>::new()),
-        first_import_meta: true,
-        tree_shaking_mode: options.tree_shaking_mode,
-        import_externals: options.import_externals,
-        ignore_dynamic_requests: options.ignore_dynamic_requests,
-        url_rewrite_behavior: options.url_rewrite_behavior,
-    };
-
-    enum Action {
-        Effect(Effect),
-        LeaveScope(u32),
-    }
-
-    // This is a stack of effects to process. We use a stack since during processing
-    // of an effect we might want to add more effects into the middle of the
-    // processing. Using a stack where effects are appended in reverse
-    // order allows us to do that. It's recursion implemented as Stack.
-    let mut queue_stack = Mutex::new(Vec::new());
-    queue_stack
-        .get_mut()
-        .extend(effects.into_iter().map(Action::Effect).rev());
-
-    while let Some(action) = queue_stack.get_mut().pop() {
-        let effect = match action {
-            Action::LeaveScope(func_ident) => {
-                analysis_state.fun_args_values.get_mut().remove(&func_ident);
-                continue;
+                DetectedDynamicExportType::None => EcmascriptExports::EmptyCommonJs,
             }
-            Action::Effect(effect) => effect,
+        };
+        analysis.set_exports(exports);
+        anyhow::Ok((webpack_runtime, webpack_entry, webpack_chunks))
+    }
+    .instrument(span)
+    .await?;
+
+    let mut ignore_effect_span = None;
+    // Check if it was a webpack entry
+    if let Some((request, webpack_runtime_span)) = webpack_runtime {
+        let span = tracing::info_span!("webpack runtime reference");
+        async {
+            let request = Request::parse(Value::new(request.into()))
+                .to_resolved()
+                .await?;
+            let runtime = resolve_as_webpack_runtime(*origin, *request, *transforms)
+                .to_resolved()
+                .await?;
+
+            if let WebpackRuntime::Webpack5 { .. } = &*runtime.await? {
+                ignore_effect_span = Some(webpack_runtime_span);
+                analysis.add_reference(
+                    WebpackRuntimeAssetReference {
+                        origin,
+                        request,
+                        runtime,
+                        transforms,
+                    }
+                    .resolved_cell(),
+                );
+
+                if webpack_entry {
+                    analysis.add_reference(
+                        WebpackEntryAssetReference {
+                            source,
+                            runtime,
+                            transforms,
+                        }
+                        .resolved_cell(),
+                    );
+                }
+
+                for chunk in webpack_chunks {
+                    analysis.add_reference(
+                        WebpackChunkAssetReference {
+                            chunk_id: chunk,
+                            runtime,
+                            transforms,
+                        }
+                        .resolved_cell(),
+                    );
+                }
+            }
+            anyhow::Ok(())
+        }
+        .instrument(span)
+        .await?;
+    }
+    let span = tracing::info_span!("async module handling");
+    async {
+        let top_level_await_span =
+            set_handler_and_globals(&handler, globals, || has_top_level_await(program));
+        let has_top_level_await = top_level_await_span.is_some();
+
+        if eval_context.is_esm(specified_type) {
+            let async_module = AsyncModule {
+                has_top_level_await,
+                import_externals,
+            }
+            .resolved_cell();
+            analysis.set_async_module(async_module);
+        } else if let Some(span) = top_level_await_span {
+            AnalyzeIssue::new(
+                IssueSeverity::Error.cell(),
+                source.ident(),
+                Vc::cell("unexpected top level await".into()),
+                StyledString::Text("top level await is only supported in ESM modules.".into())
+                    .cell(),
+                None,
+                Some(issue_source(source, span)),
+            )
+            .to_resolved()
+            .await?
+            .emit();
+        }
+        anyhow::Ok(())
+    }
+    .instrument(span)
+    .await?;
+
+    let span = tracing::info_span!("effects processing");
+    async {
+        let effects = take(&mut var_graph.effects);
+
+        let mut analysis_state = AnalysisState {
+            handler: &handler,
+            source,
+            origin,
+            compile_time_info,
+            var_graph: &var_graph,
+            fun_args_values: Default::default(),
+            var_cache: Default::default(),
+            first_import_meta: true,
+            tree_shaking_mode: options.tree_shaking_mode,
+            import_externals: options.import_externals,
+            ignore_dynamic_requests: options.ignore_dynamic_requests,
+            url_rewrite_behavior: options.url_rewrite_behavior,
         };
 
-        let add_effects = |effects: Vec<Effect>| {
-            queue_stack
-                .lock()
-                .extend(effects.into_iter().map(Action::Effect).rev())
-        };
+        enum Action {
+            Effect(Effect),
+            LeaveScope(u32),
+        }
 
-        match effect {
-            Effect::Unreachable { start_ast_path } => {
-                analysis.add_code_gen(Unreachable::new(
-                    AstPathRange::StartAfter(start_ast_path.to_vec()).cell(),
-                ));
-            }
-            Effect::Conditional {
-                condition,
-                kind,
-                ast_path: condition_ast_path,
-                span: _,
-                in_try: _,
-            } => {
-                // Don't replace condition with it's truth-y value, if it has side effects (e.g.
-                // function calls)
-                let condition_has_side_effects = condition.has_side_effects();
+        // This is a stack of effects to process. We use a stack since during processing
+        // of an effect we might want to add more effects into the middle of the
+        // processing. Using a stack where effects are appended in reverse
+        // order allows us to do that. It's recursion implemented as Stack.
+        let mut queue_stack = Mutex::new(Vec::new());
+        queue_stack
+            .get_mut()
+            .extend(effects.into_iter().map(Action::Effect).rev());
 
-                let condition = analysis_state
-                    .link_value(condition, ImportAttributes::empty_ref())
-                    .await?;
+        while let Some(action) = queue_stack.get_mut().pop() {
+            let effect = match action {
+                Action::LeaveScope(func_ident) => {
+                    analysis_state.fun_args_values.get_mut().remove(&func_ident);
+                    continue;
+                }
+                Action::Effect(effect) => effect,
+            };
 
-                macro_rules! inactive {
-                    ($block:ident) => {
-                        analysis.add_code_gen(Unreachable::new($block.range.clone().cell()));
-                    };
+            let add_effects = |effects: Vec<Effect>| {
+                queue_stack
+                    .lock()
+                    .extend(effects.into_iter().map(Action::Effect).rev())
+            };
+
+            match effect {
+                Effect::Unreachable { start_ast_path } => {
+                    analysis.add_code_gen(Unreachable::new(AstPathRange::StartAfter(
+                        start_ast_path.to_vec(),
+                    )));
                 }
-                macro_rules! condition {
-                    ($expr:expr) => {
-                        if !condition_has_side_effects {
-                            analysis.add_code_gen(ConstantCondition::new(
-                                Value::new($expr),
-                                Vc::cell(condition_ast_path.to_vec()),
-                            ));
-                        }
-                    };
-                }
-                macro_rules! active {
-                    ($block:ident) => {
-                        queue_stack
-                            .get_mut()
-                            .extend($block.effects.into_iter().map(Action::Effect).rev())
-                    };
-                }
-                match *kind {
-                    ConditionalKind::If { then } => match condition.is_truthy() {
-                        Some(true) => {
-                            condition!(ConstantConditionValue::Truthy);
-                            active!(then);
-                        }
-                        Some(false) => {
-                            condition!(ConstantConditionValue::Falsy);
-                            inactive!(then);
-                        }
-                        None => {
-                            active!(then);
-                        }
-                    },
-                    ConditionalKind::Else { r#else } => match condition.is_truthy() {
-                        Some(true) => {
-                            condition!(ConstantConditionValue::Truthy);
-                            inactive!(r#else);
-                        }
-                        Some(false) => {
-                            condition!(ConstantConditionValue::Falsy);
-                            active!(r#else);
-                        }
-                        None => {
-                            active!(r#else);
-                        }
-                    },
-                    ConditionalKind::IfElse { then, r#else }
-                    | ConditionalKind::Ternary { then, r#else } => match condition.is_truthy() {
-                        Some(true) => {
-                            condition!(ConstantConditionValue::Truthy);
-                            active!(then);
-                            inactive!(r#else);
-                        }
-                        Some(false) => {
-                            condition!(ConstantConditionValue::Falsy);
-                            active!(r#else);
-                            inactive!(then);
-                        }
-                        None => {
-                            active!(then);
-                            active!(r#else);
-                        }
-                    },
-                    ConditionalKind::IfElseMultiple { then, r#else } => match condition.is_truthy()
-                    {
-                        Some(true) => {
-                            condition!(ConstantConditionValue::Truthy);
-                            for then in then {
+                Effect::Conditional {
+                    condition,
+                    kind,
+                    ast_path: condition_ast_path,
+                    span: _,
+                    in_try: _,
+                } => {
+                    // Don't replace condition with it's truth-y value, if it has side effects
+                    // (e.g. function calls)
+                    let condition_has_side_effects = condition.has_side_effects();
+
+                    let condition = analysis_state
+                        .link_value(*condition, ImportAttributes::empty_ref())
+                        .await?;
+
+                    macro_rules! inactive {
+                        ($block:ident) => {
+                            analysis.add_code_gen(Unreachable::new($block.range.clone()));
+                        };
+                    }
+                    macro_rules! condition {
+                        ($expr:expr) => {
+                            if !condition_has_side_effects {
+                                analysis.add_code_gen(ConstantConditionCodeGen::new(
+                                    $expr,
+                                    condition_ast_path.to_vec().into(),
+                                ));
+                            }
+                        };
+                    }
+                    macro_rules! active {
+                        ($block:ident) => {
+                            queue_stack
+                                .get_mut()
+                                .extend($block.effects.into_iter().map(Action::Effect).rev())
+                        };
+                    }
+                    match *kind {
+                        ConditionalKind::If { then } => match condition.is_truthy() {
+                            Some(true) => {
+                                condition!(ConstantConditionValue::Truthy);
                                 active!(then);
                             }
-                            for r#else in r#else {
-                                inactive!(r#else);
-                            }
-                        }
-                        Some(false) => {
-                            condition!(ConstantConditionValue::Falsy);
-                            for then in then {
+                            Some(false) => {
+                                condition!(ConstantConditionValue::Falsy);
                                 inactive!(then);
                             }
-                            for r#else in r#else {
-                                active!(r#else);
-                            }
-                        }
-                        None => {
-                            for then in then {
+                            None => {
                                 active!(then);
                             }
-                            for r#else in r#else {
+                        },
+                        ConditionalKind::Else { r#else } => match condition.is_truthy() {
+                            Some(true) => {
+                                condition!(ConstantConditionValue::Truthy);
+                                inactive!(r#else);
+                            }
+                            Some(false) => {
+                                condition!(ConstantConditionValue::Falsy);
                                 active!(r#else);
                             }
+                            None => {
+                                active!(r#else);
+                            }
+                        },
+                        ConditionalKind::IfElse { then, r#else }
+                        | ConditionalKind::Ternary { then, r#else } => {
+                            match condition.is_truthy() {
+                                Some(true) => {
+                                    condition!(ConstantConditionValue::Truthy);
+                                    active!(then);
+                                    inactive!(r#else);
+                                }
+                                Some(false) => {
+                                    condition!(ConstantConditionValue::Falsy);
+                                    active!(r#else);
+                                    inactive!(then);
+                                }
+                                None => {
+                                    active!(then);
+                                    active!(r#else);
+                                }
+                            }
                         }
-                    },
-                    ConditionalKind::And { expr } => match condition.is_truthy() {
-                        Some(true) => {
-                            condition!(ConstantConditionValue::Truthy);
-                            active!(expr);
-                        }
-                        Some(false) => {
-                            // The condition value needs to stay since it's used
-                            inactive!(expr);
-                        }
-                        None => {
-                            active!(expr);
-                        }
-                    },
-                    ConditionalKind::Or { expr } => match condition.is_truthy() {
-                        Some(true) => {
-                            // The condition value needs to stay since it's used
-                            inactive!(expr);
-                        }
-                        Some(false) => {
-                            condition!(ConstantConditionValue::Falsy);
-                            active!(expr);
-                        }
-                        None => {
-                            active!(expr);
-                        }
-                    },
-                    ConditionalKind::NullishCoalescing { expr } => match condition.is_nullish() {
-                        Some(true) => {
-                            condition!(ConstantConditionValue::Nullish);
-                            active!(expr);
-                        }
-                        Some(false) => {
-                            inactive!(expr);
-                        }
-                        None => {
-                            active!(expr);
-                        }
-                    },
-                }
-            }
-            Effect::Call {
-                func,
-                args,
-                ast_path,
-                span,
-                in_try,
-                new,
-            } => {
-                if let Some(ignored) = &ignore_effect_span {
-                    if *ignored == span {
-                        continue;
-                    }
-                }
-
-                let func = analysis_state
-                    .link_value(func, eval_context.imports.get_attributes(span))
-                    .await?;
-
-                handle_call(
-                    &ast_path,
-                    span,
-                    func,
-                    JsValue::unknown_empty(false, "no this provided"),
-                    args,
-                    &analysis_state,
-                    &add_effects,
-                    &mut analysis,
-                    in_try,
-                    new,
-                )
-                .await?;
-            }
-            Effect::MemberCall {
-                obj,
-                prop,
-                mut args,
-                ast_path,
-                span,
-                in_try,
-                new,
-            } => {
-                if let Some(ignored) = &ignore_effect_span {
-                    if *ignored == span {
-                        continue;
-                    }
-                }
-                let mut obj = analysis_state
-                    .link_value(obj, ImportAttributes::empty_ref())
-                    .await?;
-                let prop = analysis_state
-                    .link_value(prop, ImportAttributes::empty_ref())
-                    .await?;
-
-                if !new {
-                    if let JsValue::Array {
-                        items: ref mut values,
-                        mutable,
-                        ..
-                    } = obj
-                    {
-                        if matches!(prop.as_str(), Some("map" | "forEach" | "filter")) {
-                            if let [EffectArg::Closure(value, block)] = &mut args[..] {
-                                *value = analysis_state
-                                    .link_value(take(value), ImportAttributes::empty_ref())
-                                    .await?;
-                                if let JsValue::Function(_, func_ident, _) = value {
-                                    let mut closure_arg = JsValue::alternatives(take(values));
-                                    if mutable {
-                                        closure_arg.add_unknown_mutations(true);
+                        ConditionalKind::IfElseMultiple { then, r#else } => {
+                            match condition.is_truthy() {
+                                Some(true) => {
+                                    condition!(ConstantConditionValue::Truthy);
+                                    for then in then {
+                                        active!(then);
                                     }
-                                    analysis_state
-                                        .fun_args_values
-                                        .get_mut()
-                                        .insert(*func_ident, vec![closure_arg]);
-                                    queue_stack.get_mut().push(Action::LeaveScope(*func_ident));
-                                    queue_stack.get_mut().extend(
-                                        take(&mut block.effects)
-                                            .into_iter()
-                                            .map(Action::Effect)
-                                            .rev(),
-                                    );
-                                    continue;
+                                    for r#else in r#else {
+                                        inactive!(r#else);
+                                    }
+                                }
+                                Some(false) => {
+                                    condition!(ConstantConditionValue::Falsy);
+                                    for then in then {
+                                        inactive!(then);
+                                    }
+                                    for r#else in r#else {
+                                        active!(r#else);
+                                    }
+                                }
+                                None => {
+                                    for then in then {
+                                        active!(then);
+                                    }
+                                    for r#else in r#else {
+                                        active!(r#else);
+                                    }
+                                }
+                            }
+                        }
+                        ConditionalKind::And { expr } => match condition.is_truthy() {
+                            Some(true) => {
+                                condition!(ConstantConditionValue::Truthy);
+                                active!(expr);
+                            }
+                            Some(false) => {
+                                // The condition value needs to stay since it's used
+                                inactive!(expr);
+                            }
+                            None => {
+                                active!(expr);
+                            }
+                        },
+                        ConditionalKind::Or { expr } => match condition.is_truthy() {
+                            Some(true) => {
+                                // The condition value needs to stay since it's used
+                                inactive!(expr);
+                            }
+                            Some(false) => {
+                                condition!(ConstantConditionValue::Falsy);
+                                active!(expr);
+                            }
+                            None => {
+                                active!(expr);
+                            }
+                        },
+                        ConditionalKind::NullishCoalescing { expr } => {
+                            match condition.is_nullish() {
+                                Some(true) => {
+                                    condition!(ConstantConditionValue::Nullish);
+                                    active!(expr);
+                                }
+                                Some(false) => {
+                                    inactive!(expr);
+                                }
+                                None => {
+                                    active!(expr);
                                 }
                             }
                         }
                     }
                 }
-
-                let func = analysis_state
-                    .link_value(
-                        JsValue::member(Box::new(obj.clone()), Box::new(prop)),
-                        ImportAttributes::empty_ref(),
-                    )
-                    .await?;
-
-                handle_call(
-                    &ast_path,
-                    span,
+                Effect::Call {
                     func,
-                    obj,
                     args,
-                    &analysis_state,
-                    &add_effects,
-                    &mut analysis,
+                    ast_path,
+                    span,
                     in_try,
                     new,
-                )
-                .await?;
-            }
-            Effect::FreeVar {
-                var,
-                ast_path,
-                span,
-                in_try: _,
-            } => {
-                // FreeVar("require") might be turbopackIgnore-d
-                if !analysis_state
-                    .link_value(var.clone(), eval_context.imports.get_attributes(span))
-                    .await?
-                    .is_unknown()
-                {
-                    handle_free_var(&ast_path, var, span, &analysis_state, &mut analysis).await?;
-                }
-            }
-            Effect::Member {
-                obj,
-                prop,
-                ast_path,
-                span,
-                in_try: _,
-            } => {
-                let obj = analysis_state
-                    .link_value(obj, ImportAttributes::empty_ref())
-                    .await?;
-                let prop = analysis_state
-                    .link_value(prop, ImportAttributes::empty_ref())
-                    .await?;
+                } => {
+                    if let Some(ignored) = &ignore_effect_span {
+                        if *ignored == span {
+                            continue;
+                        }
+                    }
 
-                handle_member(&ast_path, obj, prop, span, &analysis_state, &mut analysis).await?;
-            }
-            Effect::ImportedBinding {
-                esm_reference_index,
-                export,
-                ast_path,
-                span: _,
-                in_try: _,
-            } => {
-                if let Some(&r) = import_references.get(esm_reference_index) {
-                    if let Some("__turbopack_module_id__") = export.as_deref() {
-                        analysis.add_reference(
-                            EsmModuleIdAssetReference::new(*r, Vc::cell(ast_path))
-                                .to_resolved()
-                                .await?,
+                    let func = analysis_state
+                        .link_value(*func, eval_context.imports.get_attributes(span))
+                        .await?;
+
+                    handle_call(
+                        &ast_path,
+                        span,
+                        func,
+                        JsValue::unknown_empty(false, "no this provided"),
+                        args,
+                        &analysis_state,
+                        &add_effects,
+                        &mut analysis,
+                        in_try,
+                        new,
+                    )
+                    .await?;
+                }
+                Effect::MemberCall {
+                    obj,
+                    prop,
+                    mut args,
+                    ast_path,
+                    span,
+                    in_try,
+                    new,
+                } => {
+                    if let Some(ignored) = &ignore_effect_span {
+                        if *ignored == span {
+                            continue;
+                        }
+                    }
+                    let mut obj = analysis_state
+                        .link_value(*obj, ImportAttributes::empty_ref())
+                        .await?;
+                    let prop = analysis_state
+                        .link_value(*prop, ImportAttributes::empty_ref())
+                        .await?;
+
+                    if !new {
+                        if let JsValue::Array {
+                            items: ref mut values,
+                            mutable,
+                            ..
+                        } = obj
+                        {
+                            if matches!(prop.as_str(), Some("map" | "forEach" | "filter")) {
+                                if let [EffectArg::Closure(value, block)] = &mut args[..] {
+                                    *value = analysis_state
+                                        .link_value(take(value), ImportAttributes::empty_ref())
+                                        .await?;
+                                    if let JsValue::Function(_, func_ident, _) = value {
+                                        let mut closure_arg = JsValue::alternatives(take(values));
+                                        if mutable {
+                                            closure_arg.add_unknown_mutations(true);
+                                        }
+                                        analysis_state
+                                            .fun_args_values
+                                            .get_mut()
+                                            .insert(*func_ident, vec![closure_arg]);
+                                        queue_stack.get_mut().push(Action::LeaveScope(*func_ident));
+                                        queue_stack.get_mut().extend(
+                                            take(&mut block.effects)
+                                                .into_iter()
+                                                .map(Action::Effect)
+                                                .rev(),
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let func = analysis_state
+                        .link_value(
+                            JsValue::member(Box::new(obj.clone()), Box::new(prop)),
+                            ImportAttributes::empty_ref(),
                         )
-                    } else {
-                        analysis.add_local_reference(r);
-                        analysis.add_import_reference(r);
-                        analysis.add_binding(EsmBinding::new(
-                            r,
-                            export,
-                            ResolvedVc::cell(ast_path),
-                        ));
+                        .await?;
+
+                    handle_call(
+                        &ast_path,
+                        span,
+                        func,
+                        obj,
+                        args,
+                        &analysis_state,
+                        &add_effects,
+                        &mut analysis,
+                        in_try,
+                        new,
+                    )
+                    .await?;
+                }
+                Effect::FreeVar {
+                    var,
+                    ast_path,
+                    span,
+                    in_try: _,
+                } => {
+                    // FreeVar("require") might be turbopackIgnore-d
+                    if !analysis_state
+                        .link_value(*var.clone(), eval_context.imports.get_attributes(span))
+                        .await?
+                        .is_unknown()
+                    {
+                        handle_free_var(&ast_path, *var, span, &analysis_state, &mut analysis)
+                            .await?;
                     }
                 }
-            }
-            Effect::TypeOf {
-                arg,
-                ast_path,
-                span,
-            } => {
-                let arg = analysis_state
-                    .link_value(arg, ImportAttributes::empty_ref())
-                    .await?;
-                handle_typeof(&ast_path, arg, span, &analysis_state, &mut analysis).await?;
-            }
-            Effect::ImportMeta {
-                ast_path,
-                span: _,
-                in_try: _,
-            } => {
-                if analysis_state.first_import_meta {
-                    analysis_state.first_import_meta = false;
-                    analysis.add_code_gen(ImportMetaBinding::new(source.ident().path()));
-                }
+                Effect::Member {
+                    obj,
+                    prop,
+                    ast_path,
+                    span,
+                    in_try: _,
+                } => {
+                    let obj = analysis_state
+                        .link_value(*obj, ImportAttributes::empty_ref())
+                        .await?;
+                    let prop = analysis_state
+                        .link_value(*prop, ImportAttributes::empty_ref())
+                        .await?;
 
-                analysis.add_code_gen(ImportMetaRef::new(Vc::cell(ast_path)));
+                    handle_member(&ast_path, obj, prop, span, &analysis_state, &mut analysis)
+                        .await?;
+                }
+                Effect::ImportedBinding {
+                    esm_reference_index,
+                    export,
+                    ast_path,
+                    span: _,
+                    in_try: _,
+                } => {
+                    if let Some(&r) = import_references.get(esm_reference_index) {
+                        if let Some("__turbopack_module_id__") = export.as_deref() {
+                            analysis.add_reference(
+                                EsmModuleIdAssetReference::new(*r, Vc::cell(ast_path))
+                                    .to_resolved()
+                                    .await?,
+                            )
+                        } else {
+                            let r = match options.tree_shaking_mode {
+                                Some(TreeShakingMode::ReexportsOnly) => {
+                                    let r_ref = r.await?;
+                                    if r_ref.export_name.is_none() && export.is_some() {
+                                        let export = export.clone().unwrap();
+                                        EsmAssetReference::new(
+                                            r_ref.origin,
+                                            r_ref.request,
+                                            r_ref.issue_source.clone(),
+                                            Value::new(r_ref.annotations.clone()),
+                                            Some(ModulePart::export(export).to_resolved().await?),
+                                            r_ref.import_externals,
+                                        )
+                                        .to_resolved()
+                                        .await?
+                                    } else {
+                                        r
+                                    }
+                                }
+                                _ => r,
+                            };
+
+                            analysis.add_local_reference(r);
+                            analysis.add_import_reference(r);
+                            analysis.add_code_gen(EsmBinding::new(r, export, ast_path.into()));
+                        }
+                    }
+                }
+                Effect::TypeOf {
+                    arg,
+                    ast_path,
+                    span,
+                } => {
+                    let arg = analysis_state
+                        .link_value(*arg, ImportAttributes::empty_ref())
+                        .await?;
+                    handle_typeof(&ast_path, arg, span, &analysis_state, &mut analysis).await?;
+                }
+                Effect::ImportMeta {
+                    ast_path,
+                    span: _,
+                    in_try: _,
+                } => {
+                    if analysis_state.first_import_meta {
+                        analysis_state.first_import_meta = false;
+                        analysis.add_code_gen(ImportMetaBinding::new(
+                            source.ident().path().to_resolved().await?,
+                        ));
+                    }
+
+                    analysis.add_code_gen(ImportMetaRef::new(ast_path.into()));
+                }
             }
         }
+        anyhow::Ok(())
     }
+    .instrument(span)
+    .await?;
 
     analysis.set_successful(true);
 
@@ -1274,9 +1336,9 @@ async fn compile_time_info_for_module_type(
 
     let mut free_var_references = free_var_references.await?.clone_value();
     let (typeof_exports, typeof_module, require) = if is_esm {
-        ("undefined", "undefined", "__turbopack_require_stub__")
+        ("undefined", "undefined", TURBOPACK_REQUIRE_STUB)
     } else {
-        ("object", "object", "__turbopack_require_real__")
+        ("object", "object", TURBOPACK_REQUIRE_REAL)
     };
     free_var_references
         .entry(vec![
@@ -1305,7 +1367,16 @@ async fn compile_time_info_for_module_type(
         .or_insert("function".into());
     free_var_references
         .entry(vec![DefineableNameSegment::Name("require".into())])
-        .or_insert(FreeVarReference::Ident(require.into()));
+        .or_insert(require.into());
+
+    free_var_references.extend(TUBROPACK_RUNTIME_FUNCTION_SHORTCUTS.into_iter().map(
+        |(name, shortcut)| {
+            (
+                vec![DefineableNameSegment::Name(name.into())],
+                shortcut.into(),
+            )
+        },
+    ));
 
     Ok(CompileTimeInfo {
         environment: compile_time_info.environment,
@@ -1393,11 +1464,9 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                                 Request::parse(Value::new(pat)),
                                 compile_time_info.environment().rendering(),
                                 Vc::cell(ast_path.to_vec()),
-                                issue_source(*source, span),
+                                issue_source(source, span),
                                 in_try,
-                                url_rewrite_behavior
-                                    .unwrap_or(UrlRewriteBehavior::Relative)
-                                    .cell(),
+                                url_rewrite_behavior.unwrap_or(UrlRewriteBehavior::Relative),
                             )
                             .to_resolved()
                             .await?,
@@ -1430,7 +1499,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                                 *origin,
                                 Request::parse(Value::new(pat)),
                                 Vc::cell(ast_path.to_vec()),
-                                issue_source(*source, span),
+                                issue_source(source, span),
                                 in_try,
                             )
                             .to_resolved()
@@ -1519,9 +1588,8 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         ),
                     );
                     if ignore_dynamic_requests {
-                        analysis.add_code_gen(DynamicExpression::new_promise(Vc::cell(
-                            ast_path.to_vec(),
-                        )));
+                        analysis
+                            .add_code_gen(DynamicExpression::new_promise(ast_path.to_vec().into()));
                         return Ok(());
                     }
                 }
@@ -1530,7 +1598,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         *origin,
                         Request::parse(Value::new(pat)),
                         Vc::cell(ast_path.to_vec()),
-                        issue_source(*source, span),
+                        issue_source(source, span),
                         Value::new(import_annotations),
                         in_try,
                         state.import_externals,
@@ -1563,7 +1631,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         ),
                     );
                     if ignore_dynamic_requests {
-                        analysis.add_code_gen(DynamicExpression::new(Vc::cell(ast_path.to_vec())));
+                        analysis.add_code_gen(DynamicExpression::new(ast_path.to_vec().into()));
                         return Ok(());
                     }
                 }
@@ -1572,7 +1640,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         *origin,
                         Request::parse(Value::new(pat)),
                         Vc::cell(ast_path.to_vec()),
-                        issue_source(*source, span),
+                        issue_source(source, span),
                         in_try,
                     )
                     .to_resolved()
@@ -1617,7 +1685,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         ),
                     );
                     if ignore_dynamic_requests {
-                        analysis.add_code_gen(DynamicExpression::new(Vc::cell(ast_path.to_vec())));
+                        analysis.add_code_gen(DynamicExpression::new(ast_path.to_vec().into()));
                         return Ok(());
                     }
                 }
@@ -1626,7 +1694,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         *origin,
                         Request::parse(Value::new(pat)),
                         Vc::cell(ast_path.to_vec()),
-                        issue_source(*source, span),
+                        issue_source(source, span),
                         in_try,
                     )
                     .to_resolved()
@@ -1672,7 +1740,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     options.include_subdirs,
                     Vc::cell(options.filter),
                     Vc::cell(ast_path.to_vec()),
-                    Some(issue_source(*source, span)),
+                    Some(issue_source(source, span)),
                     in_try,
                 )
                 .to_resolved()
@@ -1816,7 +1884,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                             CjsAssetReference::new(
                                 *origin,
                                 Request::parse(Value::new(pat)),
-                                issue_source(*source, span),
+                                issue_source(source, span),
                                 in_try,
                             )
                             .to_resolved()
@@ -1878,7 +1946,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     CjsAssetReference::new(
                         *origin,
                         Request::parse(Value::new(pat)),
-                        issue_source(*source, span),
+                        issue_source(source, span),
                         in_try,
                     )
                     .to_resolved()
@@ -2055,7 +2123,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                                         CjsAssetReference::new(
                                             *origin,
                                             Request::parse(Value::new(pat)),
-                                            issue_source(*source, span),
+                                            issue_source(source, span),
                                             in_try,
                                         )
                                         .to_resolved()
@@ -2127,7 +2195,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     CjsAssetReference::new(
                         *origin,
                         Request::parse(Value::new(js_value_to_pattern(&args[1]))),
-                        issue_source(*source, span),
+                        issue_source(source, span),
                         in_try,
                     )
                     .to_resolved()
@@ -2235,12 +2303,7 @@ async fn handle_member(
             JsValue::WellKnownFunction(WellKnownFunctionKind::Require { .. }),
             JsValue::Constant(s),
         ) if s.as_str() == Some("cache") => {
-            analysis.add_code_gen(
-                CjsRequireCacheAccess {
-                    path: ResolvedVc::cell(ast_path.to_vec()),
-                }
-                .cell(),
-            );
+            analysis.add_code_gen(CjsRequireCacheAccess::new(ast_path.to_vec().into()));
         }
         _ => {}
     }
@@ -2329,15 +2392,22 @@ async fn handle_free_var_reference(
         ),
 
         FreeVarReference::Value(value) => {
-            analysis.add_code_gen(ConstantValue::new(
+            analysis.add_code_gen(ConstantValueCodeGen::new(
                 Value::new(value.clone()),
-                Vc::cell(ast_path.to_vec()),
+                ast_path.to_vec().into(),
             ));
         }
         FreeVarReference::Ident(value) => {
             analysis.add_code_gen(IdentReplacement::new(
                 value.clone(),
-                Vc::cell(ast_path.to_vec()),
+                ast_path.to_vec().into(),
+            ));
+        }
+        FreeVarReference::Member(key, value) => {
+            analysis.add_code_gen(MemberReplacement::new(
+                key.clone(),
+                value.clone(),
+                ast_path.to_vec().into(),
             ));
         }
         FreeVarReference::EcmaScriptModule {
@@ -2346,24 +2416,29 @@ async fn handle_free_var_reference(
             export,
         } => {
             let esm_reference = EsmAssetReference::new(
-                lookup_path.map_or(*state.origin, |lookup_path| {
-                    Vc::upcast(PlainResolveOrigin::new(
-                        state.origin.asset_context(),
-                        *lookup_path,
-                    ))
-                }),
-                Request::parse(Value::new(request.clone().into())),
-                IssueSource::from_swc_offsets(
-                    *state.source,
-                    span.lo.to_usize(),
-                    span.hi.to_usize(),
-                ),
+                if let Some(lookup_path) = lookup_path {
+                    ResolvedVc::upcast(
+                        PlainResolveOrigin::new(state.origin.asset_context(), **lookup_path)
+                            .to_resolved()
+                            .await?,
+                    )
+                } else {
+                    state.origin
+                },
+                Request::parse(Value::new(request.clone().into()))
+                    .to_resolved()
+                    .await?,
+                IssueSource::from_swc_offsets(state.source, span.lo.to_usize(), span.hi.to_usize()),
                 Default::default(),
                 match state.tree_shaking_mode {
                     Some(TreeShakingMode::ModuleFragments)
-                    | Some(TreeShakingMode::ReexportsOnly) => export
-                        .as_ref()
-                        .map(|export| ModulePart::export(export.clone())),
+                    | Some(TreeShakingMode::ReexportsOnly) => {
+                        if let Some(export) = export {
+                            Some(ModulePart::export(export.clone()).to_resolved().await?)
+                        } else {
+                            None
+                        }
+                    }
                     None => None,
                 },
                 state.import_externals,
@@ -2371,17 +2446,17 @@ async fn handle_free_var_reference(
             .to_resolved()
             .await?;
             analysis.add_reference(esm_reference);
-            analysis.add_binding(EsmBinding::new(
+            analysis.add_code_gen(EsmBinding::new(
                 esm_reference,
                 export.clone(),
-                ResolvedVc::cell(ast_path.to_vec()),
+                ast_path.to_vec().into(),
             ));
         }
     }
     Ok(true)
 }
 
-fn issue_source(source: Vc<Box<dyn Source>>, span: Span) -> Vc<IssueSource> {
+fn issue_source(source: ResolvedVc<Box<dyn Source>>, span: Span) -> IssueSource {
     IssueSource::from_swc_offsets(source, span.lo.to_usize(), span.hi.to_usize())
 }
 
@@ -2424,9 +2499,9 @@ async fn analyze_amd_define(
                     AmdDefineDependencyElement::Module,
                 ],
                 origin,
-                ResolvedVc::cell(ast_path.to_vec()),
+                ast_path.to_vec().into(),
                 AmdDefineFactoryType::Function,
-                issue_source(*source, span).to_resolved().await?,
+                issue_source(source, span),
                 in_try,
             ));
         }
@@ -2438,9 +2513,9 @@ async fn analyze_amd_define(
                     AmdDefineDependencyElement::Module,
                 ],
                 origin,
-                ResolvedVc::cell(ast_path.to_vec()),
+                ast_path.to_vec().into(),
                 AmdDefineFactoryType::Unknown,
-                issue_source(*source, span).to_resolved().await?,
+                issue_source(source, span),
                 in_try,
             ));
         }
@@ -2452,9 +2527,9 @@ async fn analyze_amd_define(
                     AmdDefineDependencyElement::Module,
                 ],
                 origin,
-                ResolvedVc::cell(ast_path.to_vec()),
+                ast_path.to_vec().into(),
                 AmdDefineFactoryType::Function,
-                issue_source(*source, span).to_resolved().await?,
+                issue_source(source, span),
                 in_try,
             ));
         }
@@ -2462,9 +2537,9 @@ async fn analyze_amd_define(
             analysis.add_code_gen(AmdDefineWithDependenciesCodeGen::new(
                 vec![],
                 origin,
-                ResolvedVc::cell(ast_path.to_vec()),
+                ast_path.to_vec().into(),
                 AmdDefineFactoryType::Value,
-                issue_source(*source, span).to_resolved().await?,
+                issue_source(source, span),
                 in_try,
             ));
         }
@@ -2476,9 +2551,9 @@ async fn analyze_amd_define(
                     AmdDefineDependencyElement::Module,
                 ],
                 origin,
-                ResolvedVc::cell(ast_path.to_vec()),
+                ast_path.to_vec().into(),
                 AmdDefineFactoryType::Unknown,
-                issue_source(*source, span).to_resolved().await?,
+                issue_source(source, span),
                 in_try,
             ));
         }
@@ -2530,7 +2605,7 @@ async fn analyze_amd_define_with_deps(
                     let reference = AmdDefineAssetReference::new(
                         *origin,
                         *request,
-                        issue_source(*source, span),
+                        issue_source(source, span),
                         in_try,
                     )
                     .to_resolved()
@@ -2564,9 +2639,9 @@ async fn analyze_amd_define_with_deps(
     analysis.add_code_gen(AmdDefineWithDependenciesCodeGen::new(
         requests,
         origin,
-        ResolvedVc::cell(ast_path.to_vec()),
+        ast_path.to_vec().into(),
         AmdDefineFactoryType::Function,
-        issue_source(*source, span).to_resolved().await?,
+        issue_source(source, span),
         in_try,
     ));
 
@@ -2808,9 +2883,7 @@ async fn require_context_visitor(
 
     Ok(JsValue::WellKnownFunction(
         WellKnownFunctionKind::RequireContextRequire(
-            RequireContextValue::from_context_map(map)
-                .to_resolved()
-                .await?,
+            RequireContextValue::from_context_map(map).await?,
         ),
     ))
 }
@@ -2826,7 +2899,7 @@ enum StaticExpr {
 // TODO get rid of that
 #[derive(Default)]
 struct StaticAnalyser {
-    imports: HashMap<String, (String, Vec<String>)>,
+    imports: FxHashMap<String, (String, Vec<String>)>,
 }
 
 impl StaticAnalyser {
@@ -2880,10 +2953,10 @@ impl StaticAnalyser {
 struct ModuleReferencesVisitor<'a> {
     eval_context: &'a EvalContext,
     old_analyser: StaticAnalyser,
-    import_references: &'a [Vc<EsmAssetReference>],
+    import_references: &'a [ResolvedVc<EsmAssetReference>],
     analysis: &'a mut AnalyzeEcmascriptModuleResultBuilder,
     esm_exports: BTreeMap<RcStr, EsmExport>,
-    esm_star_exports: Vec<Vc<Box<dyn ModuleReference>>>,
+    esm_star_exports: Vec<ResolvedVc<Box<dyn ModuleReference>>>,
     webpack_runtime: Option<(RcStr, Span)>,
     webpack_entry: bool,
     webpack_chunks: Vec<Lit>,
@@ -2892,7 +2965,7 @@ struct ModuleReferencesVisitor<'a> {
 impl<'a> ModuleReferencesVisitor<'a> {
     fn new(
         eval_context: &'a EvalContext,
-        import_references: &'a [Vc<EsmAssetReference>],
+        import_references: &'a [ResolvedVc<EsmAssetReference>],
         analysis: &'a mut AnalyzeEcmascriptModuleResultBuilder,
     ) -> Self {
         Self {
@@ -2976,8 +3049,8 @@ impl VisitAstPath for ModuleReferencesVisitor<'_> {
         export: &'ast ExportAll,
         ast_path: &mut AstNodePath<AstParentNodeRef<'r>>,
     ) {
-        let path = Vc::cell(as_parent_path(ast_path));
-        self.analysis.add_code_gen(EsmModuleItem::new(path));
+        self.analysis
+            .add_code_gen(EsmModuleItem::new(as_parent_path(ast_path).into()));
         export.visit_children_with_ast_path(self, ast_path);
     }
 
@@ -2986,7 +3059,6 @@ impl VisitAstPath for ModuleReferencesVisitor<'_> {
         export: &'ast NamedExport,
         ast_path: &mut AstNodePath<AstParentNodeRef<'r>>,
     ) {
-        let path = Vc::cell(as_parent_path(ast_path));
         // We create mutable exports for fake ESMs generated by module splitting
         let is_fake_esm = export
             .with
@@ -3025,12 +3097,12 @@ impl VisitAstPath for ModuleReferencesVisitor<'_> {
                                 let esm_ref = self.import_references[index];
                                 if let Some(export) = export {
                                     EsmExport::ImportedBinding(
-                                        Vc::upcast(esm_ref),
+                                        ResolvedVc::upcast(esm_ref),
                                         export,
                                         is_fake_esm,
                                     )
                                 } else {
-                                    EsmExport::ImportedNamespace(Vc::upcast(esm_ref))
+                                    EsmExport::ImportedNamespace(ResolvedVc::upcast(esm_ref))
                                 }
                             } else {
                                 EsmExport::LocalBinding(binding_name, is_fake_esm)
@@ -3042,7 +3114,8 @@ impl VisitAstPath for ModuleReferencesVisitor<'_> {
             }
         }
 
-        self.analysis.add_code_gen(EsmModuleItem::new(path));
+        self.analysis
+            .add_code_gen(EsmModuleItem::new(as_parent_path(ast_path).into()));
         export.visit_children_with_ast_path(self, ast_path);
     }
 
@@ -3056,7 +3129,7 @@ impl VisitAstPath for ModuleReferencesVisitor<'_> {
                 .insert(name.clone(), EsmExport::LocalBinding(name, false));
         });
         self.analysis
-            .add_code_gen(EsmModuleItem::new(Vc::cell(as_parent_path(ast_path))));
+            .add_code_gen(EsmModuleItem::new(as_parent_path(ast_path).into()));
         export.visit_children_with_ast_path(self, ast_path);
     }
 
@@ -3070,7 +3143,7 @@ impl VisitAstPath for ModuleReferencesVisitor<'_> {
             EsmExport::LocalBinding(magic_identifier::mangle("default export").into(), false),
         );
         self.analysis
-            .add_code_gen(EsmModuleItem::new(Vc::cell(as_parent_path(ast_path))));
+            .add_code_gen(EsmModuleItem::new(as_parent_path(ast_path).into()));
         export.visit_children_with_ast_path(self, ast_path);
     }
 
@@ -3097,7 +3170,7 @@ impl VisitAstPath for ModuleReferencesVisitor<'_> {
             }
         }
         self.analysis
-            .add_code_gen(EsmModuleItem::new(Vc::cell(as_parent_path(ast_path))));
+            .add_code_gen(EsmModuleItem::new(as_parent_path(ast_path).into()));
         export.visit_children_with_ast_path(self, ast_path);
     }
 
@@ -3106,7 +3179,7 @@ impl VisitAstPath for ModuleReferencesVisitor<'_> {
         import: &'ast ImportDecl,
         ast_path: &mut AstNodePath<AstParentNodeRef<'r>>,
     ) {
-        let path = Vc::cell(as_parent_path(ast_path));
+        let path = as_parent_path(ast_path).into();
         let src = import.src.value.to_string();
         import.visit_children_with_ast_path(self, ast_path);
         if import.type_only {
@@ -3239,9 +3312,23 @@ async fn resolve_as_webpack_runtime(
     }
 }
 
-// TODO enable serialization
-#[turbo_tasks::value(transparent, serialization = "none")]
+#[turbo_tasks::value(transparent)]
+#[derive(Hash, Debug, Clone)]
 pub struct AstPath(#[turbo_tasks(trace_ignore)] Vec<AstParentKind>);
+
+impl Deref for AstPath {
+    type Target = [AstParentKind];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Vec<AstParentKind>> for AstPath {
+    fn from(v: Vec<AstParentKind>) -> Self {
+        Self(v)
+    }
+}
 
 pub static TURBOPACK_HELPER: Lazy<JsWord> = Lazy::new(|| "__turbopack-helper__".into());
 
@@ -3308,10 +3395,34 @@ fn detect_dynamic_export(p: &Program) -> DetectedDynamicExportType {
                 self.found = true;
             }
         }
+
         fn visit_expr(&mut self, n: &Expr) {
             if self.found {
                 return;
             }
+
+            if let Expr::Member(member) = n {
+                if member.obj.is_ident_ref_to("__turbopack_context__") {
+                    if let MemberProp::Ident(prop) = &member.prop {
+                        const TURBOPACK_EXPORT_VALUE_SHORTCUT: &str =
+                            TURBOPACK_EXPORT_VALUE.shortcut;
+                        const TURBOPACK_EXPORT_NAMESPACE_SHORTCUT: &str =
+                            TURBOPACK_EXPORT_NAMESPACE.shortcut;
+                        match &*prop.sym {
+                            TURBOPACK_EXPORT_VALUE_SHORTCUT => {
+                                self.value = true;
+                                self.found = true;
+                            }
+                            TURBOPACK_EXPORT_NAMESPACE_SHORTCUT => {
+                                self.namespace = true;
+                                self.found = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
             n.visit_children_with(self);
         }
 
@@ -3367,7 +3478,7 @@ fn is_invoking_node_process_eval(args: &[JsValue]) -> bool {
                 {
                     // Is `-e` one of the arguments passed to the program?
                     if items.iter().any(|e| {
-                        if let JsValue::Constant(JsConstantValue::Str(ConstantString::Word(arg))) =
+                        if let JsValue::Constant(JsConstantValue::Str(ConstantString::Atom(arg))) =
                             e
                         {
                             arg == "-e"

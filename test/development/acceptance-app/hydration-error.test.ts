@@ -76,7 +76,7 @@ describe('Error overlay for hydration errors in App router', () => {
     expect(await getRedboxTotalErrorCount(browser)).toBe(1)
 
     expect(await session.getRedboxDescription()).toMatchInlineSnapshot(
-      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used"`
+      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used:"`
     )
 
     expect(await session.getRedboxDescriptionWarning()).toMatchInlineSnapshot(`
@@ -173,7 +173,7 @@ describe('Error overlay for hydration errors in App router', () => {
     }
 
     expect(await session.getRedboxDescription()).toMatchInlineSnapshot(
-      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used"`
+      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used:"`
     )
   })
 
@@ -209,7 +209,7 @@ describe('Error overlay for hydration errors in App router', () => {
     expect(pseudoHtml).toMatchInlineSnapshot(`"- className="server-html""`)
 
     expect(await session.getRedboxDescription()).toMatchInlineSnapshot(
-      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used"`
+      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used:"`
     )
   })
 
@@ -259,7 +259,7 @@ describe('Error overlay for hydration errors in App router', () => {
     }
 
     expect(await session.getRedboxDescription()).toMatchInlineSnapshot(
-      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used"`
+      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used:"`
     )
   })
 
@@ -304,7 +304,7 @@ describe('Error overlay for hydration errors in App router', () => {
     }
 
     expect(await session.getRedboxDescription()).toMatchInlineSnapshot(
-      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used"`
+      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used:"`
     )
   })
 
@@ -330,7 +330,7 @@ describe('Error overlay for hydration errors in App router', () => {
     expect(await getRedboxTotalErrorCount(browser)).toBe(1)
 
     expect(await session.getRedboxDescription()).toMatchInlineSnapshot(
-      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used"`
+      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used:"`
     )
 
     const pseudoHtml = await session.getRedboxComponentStack()
@@ -374,11 +374,13 @@ describe('Error overlay for hydration errors in App router', () => {
     const { session, browser } = sandbox
     await session.openRedbox()
 
-    expect(await getRedboxTotalErrorCount(browser)).toBe(2)
+    await retry(async () => {
+      expect(await getRedboxTotalErrorCount(browser)).toBe(2)
+    })
 
     // FIXME: Should also have "text nodes cannot be a child of tr"
     expect(await session.getRedboxDescription()).toMatchInlineSnapshot(
-      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used"`
+      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used:"`
     )
 
     const pseudoHtml = await session.getRedboxComponentStack()
@@ -439,7 +441,6 @@ describe('Error overlay for hydration errors in App router', () => {
                        <RedirectBoundary>
                          <RedirectErrorBoundary router={{...}}>
                            <InnerLayoutRouter url="/" tree={[...]} cacheNode={{lazyData:null, ...}} segmentPath={[...]}>
-                             <__next_metadata_boundary__>
                              <ClientPageRoot Component={function Page} searchParams={{}} params={{}}>
                                <Page params={Promise} searchParams={Promise}>
      >                           <table>
@@ -503,7 +504,7 @@ describe('Error overlay for hydration errors in App router', () => {
     }
 
     expect(await session.getRedboxDescription()).toMatchInlineSnapshot(
-      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used"`
+      `"Hydration failed because the server rendered HTML didn't match the client. As a result this tree will be regenerated on the client. This can happen if a SSR-ed Client Component used:"`
     )
   })
 
@@ -567,7 +568,9 @@ describe('Error overlay for hydration errors in App router', () => {
     const { session, browser } = sandbox
     await session.openRedbox()
 
-    expect(await getRedboxTotalErrorCount(browser)).toBe(2)
+    await retry(async () => {
+      expect(await getRedboxTotalErrorCount(browser)).toBe(2)
+    })
 
     const description = await session.getRedboxDescription()
     expect(description).toContain(
@@ -665,7 +668,9 @@ describe('Error overlay for hydration errors in App router', () => {
     const { session, browser } = sandbox
     await session.openRedbox()
 
-    expect(await getRedboxTotalErrorCount(browser)).toBe(2)
+    await retry(async () => {
+      expect(await getRedboxTotalErrorCount(browser)).toBe(2)
+    })
 
     const description = await session.getRedboxDescription()
     expect(description).toEqual(outdent`
@@ -718,7 +723,9 @@ describe('Error overlay for hydration errors in App router', () => {
     const { session, browser } = sandbox
     await session.openRedbox()
 
-    expect(await getRedboxTotalErrorCount(browser)).toBe(2)
+    await retry(async () => {
+      expect(await getRedboxTotalErrorCount(browser)).toBe(2)
+    })
 
     const description = await session.getRedboxDescription()
     expect(description).toContain(
@@ -895,19 +902,18 @@ describe('Error overlay for hydration errors in App router', () => {
            <RedirectBoundary>
              <RedirectErrorBoundary router={{...}}>
                <InnerLayoutRouter url="/" tree={[...]} cacheNode={{lazyData:null, ...}} segmentPath={[...]}>
-                 <__next_metadata_boundary__>
-                   <ClientPageRoot Component={function Page} searchParams={{}} params={{}}>
-                     <Page params={Promise} searchParams={Promise}>
+                 <ClientPageRoot Component={function Page} searchParams={{}} params={{}}>
+                   <Page params={Promise} searchParams={Promise}>
+                     <div>
                        <div>
                          <div>
                            <div>
-                             <div>
-                               <Mismatch>
-                                 <p>
-                                   <span>
-                                     ...
-       +                              client
-       -                              server"
+                             <Mismatch>
+                               <p>
+                                 <span>
+                                   ...
+       +                            client
+       -                            server"
       `)
     } else {
       expect(fullPseudoHtml).toMatchInlineSnapshot(`
@@ -916,19 +922,18 @@ describe('Error overlay for hydration errors in App router', () => {
            <RedirectBoundary>
              <RedirectErrorBoundary router={{...}}>
                <InnerLayoutRouter url="/" tree={[...]} cacheNode={{lazyData:null, ...}} segmentPath={[...]}>
-                 <__next_metadata_boundary__>
-                   <ClientPageRoot Component={function Page} searchParams={{}} params={{}}>
-                     <Page params={Promise} searchParams={Promise}>
+                 <ClientPageRoot Component={function Page} searchParams={{}} params={{}}>
+                   <Page params={Promise} searchParams={Promise}>
+                     <div>
                        <div>
                          <div>
                            <div>
-                             <div>
-                               <Mismatch>
-                                 <p>
-                                   <span>
-                                     ...
-       +                              client
-       -                              server"
+                             <Mismatch>
+                               <p>
+                                 <span>
+                                   ...
+       +                            client
+       -                            server"
       `)
     }
   })

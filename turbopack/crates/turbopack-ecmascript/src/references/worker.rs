@@ -10,6 +10,7 @@ use turbopack_core::{
     chunk::{ChunkableModule, ChunkableModuleReference, ChunkingContext},
     issue::{code_gen::CodeGenerationIssue, IssueExt, IssueSeverity, IssueSource, StyledString},
     module::Module,
+    module_graph::ModuleGraph,
     reference::ModuleReference,
     reference_type::{ReferenceType, WorkerReferenceSubType},
     resolve::{origin::ResolveOrigin, parse::Request, url_resolve, ModuleResolveResult},
@@ -19,6 +20,7 @@ use crate::{
     code_gen::{CodeGenerateable, CodeGeneration},
     create_visitor,
     references::AstPath,
+    runtime_functions::TURBOPACK_REQUIRE,
     worker_chunk::module::WorkerLoaderModule,
 };
 
@@ -28,7 +30,7 @@ pub struct WorkerAssetReference {
     pub origin: ResolvedVc<Box<dyn ResolveOrigin>>,
     pub request: ResolvedVc<Request>,
     pub path: ResolvedVc<AstPath>,
-    pub issue_source: ResolvedVc<IssueSource>,
+    pub issue_source: IssueSource,
     pub in_try: bool,
 }
 
@@ -39,7 +41,7 @@ impl WorkerAssetReference {
         origin: ResolvedVc<Box<dyn ResolveOrigin>>,
         request: ResolvedVc<Request>,
         path: ResolvedVc<AstPath>,
-        issue_source: ResolvedVc<IssueSource>,
+        issue_source: IssueSource,
         in_try: bool,
     ) -> Vc<Self> {
         Self::cell(WorkerAssetReference {
@@ -61,15 +63,14 @@ impl WorkerAssetReference {
             *self.request,
             // TODO support more worker types
             Value::new(ReferenceType::Worker(WorkerReferenceSubType::WebWorker)),
-            Some(*self.issue_source),
+            Some(self.issue_source.clone()),
             self.in_try,
         );
 
         let Some(module) = *module.first_module().await? else {
             return Ok(None);
         };
-        let Some(chunkable) = ResolvedVc::try_downcast::<Box<dyn ChunkableModule>>(module).await?
-        else {
+        let Some(chunkable) = ResolvedVc::try_downcast::<Box<dyn ChunkableModule>>(module) else {
             CodeGenerationIssue {
                 severity: IssueSeverity::Bug.resolved_cell(),
                 title: StyledString::Text("non-ecmascript placeable asset".into()).resolved_cell(),
@@ -119,6 +120,7 @@ impl CodeGenerateable for WorkerAssetReference {
     #[turbo_tasks::function]
     async fn code_generation(
         &self,
+        _module_graph: Vc<ModuleGraph>,
         chunking_context: Vc<Box<dyn ChunkingContext>>,
     ) -> Result<Vc<CodeGeneration>> {
         let Some(loader) = self.worker_loader_module().await? else {
@@ -138,7 +140,8 @@ impl CodeGenerateable for WorkerAssetReference {
                         Some(ExprOrSpread { spread: None, expr }) => {
                             let item_id = Expr::Lit(Lit::Str(item_id.to_string().into()));
                             *expr = quote_expr!(
-                                "__turbopack_require__($item_id)",
+                                "$turbopack_require($item_id)",
+                                turbopack_require: Expr = TURBOPACK_REQUIRE.into(),
                                 item_id: Expr = item_id
                             );
 
@@ -173,6 +176,6 @@ impl CodeGenerateable for WorkerAssetReference {
             );
         });
 
-        Ok(CodeGeneration::visitors(vec![visitor]))
+        Ok(CodeGeneration::visitors(vec![visitor]).cell())
     }
 }

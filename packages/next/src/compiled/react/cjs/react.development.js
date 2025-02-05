@@ -487,7 +487,8 @@
         oldElement._owner,
         oldElement.props
       );
-      newKey._store.validated = oldElement._store.validated;
+      oldElement._store &&
+        (newKey._store.validated = oldElement._store.validated);
       return newKey;
     }
     function validateChildKeys(node, parentType) {
@@ -956,6 +957,7 @@
         A: null,
         T: null,
         S: null,
+        V: null,
         actQueue: null,
         isBatchingLegacy: !1,
         didScheduleLegacyUpdate: !1,
@@ -1029,6 +1031,12 @@
               });
             }
           : enqueueTask;
+    deprecatedAPIs = Object.freeze({
+      __proto__: null,
+      c: function (size) {
+        return resolveDispatcher().useMemoCache(size);
+      }
+    });
     exports.Children = {
       map: mapChildren,
       forEach: function (children, forEachFunc, forEachContext) {
@@ -1070,11 +1078,7 @@
     exports.Suspense = REACT_SUSPENSE_TYPE;
     exports.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE =
       ReactSharedInternals;
-    exports.__COMPILER_RUNTIME = {
-      c: function (size) {
-        return resolveDispatcher().useMemoCache(size);
-      }
-    };
+    exports.__COMPILER_RUNTIME = deprecatedAPIs;
     exports.act = function (callback) {
       var prevActQueue = ReactSharedInternals.actQueue,
         prevActScopeDepth = actScopeDepth;
@@ -1518,7 +1522,7 @@
     exports.useTransition = function () {
       return resolveDispatcher().useTransition();
     };
-    exports.version = "19.1.0-canary-7b402084-20250107";
+    exports.version = "19.1.0-canary-0a82580b-20250203";
     "undefined" !== typeof __REACT_DEVTOOLS_GLOBAL_HOOK__ &&
       "function" ===
         typeof __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStop &&

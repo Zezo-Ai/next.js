@@ -9,6 +9,7 @@ use turbopack_core::{
     chunk::{ChunkItem, ChunkItemExt, ChunkType, ChunkableModule, ChunkingContext},
     ident::AssetIdent,
     module::Module,
+    module_graph::ModuleGraph,
     reference::{ModuleReferences, SingleChunkableModuleReference},
 };
 use turbopack_ecmascript::{
@@ -17,6 +18,7 @@ use turbopack_ecmascript::{
         EcmascriptChunkType, EcmascriptExports,
     },
     references::esm::{EsmExport, EsmExports},
+    runtime_functions::{TURBOPACK_EXPORT_NAMESPACE, TURBOPACK_IMPORT},
     utils::StringifyJs,
 };
 
@@ -78,11 +80,13 @@ impl ChunkableModule for NextDynamicEntryModule {
     #[turbo_tasks::function]
     fn as_chunk_item(
         self: ResolvedVc<Self>,
+        module_graph: ResolvedVc<ModuleGraph>,
         chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
     ) -> Vc<Box<dyn turbopack_core::chunk::ChunkItem>> {
         Vc::upcast(
             NextDynamicEntryChunkItem {
                 chunking_context,
+                module_graph,
                 inner: self,
             }
             .cell(),
@@ -94,10 +98,14 @@ impl ChunkableModule for NextDynamicEntryModule {
 impl EcmascriptChunkPlaceable for NextDynamicEntryModule {
     #[turbo_tasks::function]
     async fn get_exports(&self) -> Result<Vc<EcmascriptExports>> {
-        let module_reference = Vc::upcast(SingleChunkableModuleReference::new(
-            Vc::upcast(*self.module),
-            dynamic_ref_description(),
-        ));
+        let module_reference = ResolvedVc::upcast(
+            SingleChunkableModuleReference::new(
+                Vc::upcast(*self.module),
+                dynamic_ref_description(),
+            )
+            .to_resolved()
+            .await?,
+        );
 
         let mut exports = BTreeMap::new();
         exports.insert(
@@ -108,7 +116,7 @@ impl EcmascriptChunkPlaceable for NextDynamicEntryModule {
         Ok(EcmascriptExports::EsmExports(
             EsmExports {
                 exports,
-                star_exports: vec![module_reference.to_resolved().await?],
+                star_exports: vec![module_reference],
             }
             .resolved_cell(),
         )
@@ -119,6 +127,7 @@ impl EcmascriptChunkPlaceable for NextDynamicEntryModule {
 #[turbo_tasks::value]
 struct NextDynamicEntryChunkItem {
     chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
+    module_graph: ResolvedVc<ModuleGraph>,
     inner: ResolvedVc<NextDynamicEntryModule>,
 }
 
@@ -135,13 +144,13 @@ impl EcmascriptChunkItem for NextDynamicEntryChunkItem {
 
         let module_id = inner
             .module
-            .as_chunk_item(Vc::upcast(*self.chunking_context))
+            .as_chunk_item(*self.module_graph, Vc::upcast(*self.chunking_context))
             .id()
             .await?;
         Ok(EcmascriptChunkItemContent {
             inner_code: formatdoc!(
                 r#"
-                    __turbopack_export_namespace__(__turbopack_import__({}));
+                    {TURBOPACK_EXPORT_NAMESPACE}({TURBOPACK_IMPORT}({}));
                 "#,
                 StringifyJs(&module_id),
             )

@@ -9,6 +9,7 @@ use turbopack_core::{
     },
     ident::AssetIdent,
     module::Module,
+    module_graph::ModuleGraph,
     output::OutputAssets,
 };
 
@@ -18,12 +19,14 @@ use crate::{
         data::EcmascriptChunkData, EcmascriptChunkItem, EcmascriptChunkItemContent,
         EcmascriptChunkType,
     },
+    runtime_functions::{TURBOPACK_EXPORT_VALUE, TURBOPACK_WORKER_BLOB_URL},
     utils::StringifyJs,
 };
 
 #[turbo_tasks::value(shared)]
 pub struct WorkerLoaderChunkItem {
     pub module: ResolvedVc<WorkerLoaderModule>,
+    pub module_graph: ResolvedVc<ModuleGraph>,
     pub chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
 }
 
@@ -38,8 +41,7 @@ impl WorkerLoaderChunkItem {
     async fn chunks(&self) -> Result<Vc<OutputAssets>> {
         let module = self.module.await?;
 
-        let Some(evaluatable) =
-            ResolvedVc::try_downcast::<Box<dyn EvaluatableAsset>>(module.inner).await?
+        let Some(evaluatable) = ResolvedVc::try_downcast::<Box<dyn EvaluatableAsset>>(module.inner)
         else {
             bail!(
                 "{} is not evaluatable for Worker loader module",
@@ -54,6 +56,7 @@ impl WorkerLoaderChunkItem {
             )
             .with_modifier(worker_modifier()),
             EvaluatableAssets::empty().with_entry(*evaluatable),
+            *self.module_graph,
             Value::new(AvailabilityInfo::Root),
         ))
     }
@@ -86,7 +89,7 @@ impl EcmascriptChunkItem for WorkerLoaderChunkItem {
 
         let code = formatdoc! {
             r#"
-                __turbopack_export_value__(__turbopack_worker_blob_url__({chunks:#}));
+                {TURBOPACK_EXPORT_VALUE}({TURBOPACK_WORKER_BLOB_URL}({chunks:#}));
             "#,
             chunks = StringifyJs(&chunks_data),
         };

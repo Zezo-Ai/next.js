@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Result};
 use lightningcss::{
@@ -12,6 +9,7 @@ use lightningcss::{
     visit_types,
     visitor::Visit,
 };
+use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use swc_core::{
     base::sourcemap::SourceMapBuilder,
@@ -28,6 +26,7 @@ use turbopack_core::{
         Issue, IssueExt, IssueSource, IssueStage, OptionIssueSource, OptionStyledString,
         StyledString,
     },
+    module_graph::ModuleGraph,
     reference::ModuleReferences,
     reference_type::ImportContext,
     resolve::origin::ResolveOrigin,
@@ -147,7 +146,7 @@ pub enum CssWithPlaceholderResult {
         exports: Option<FxIndexMap<String, CssModuleExport>>,
 
         #[turbo_tasks(trace_ignore)]
-        placeholders: HashMap<String, Url<'static>>,
+        placeholders: FxHashMap<String, Url<'static>>,
     },
     Unparseable,
     NotFound,
@@ -209,7 +208,7 @@ pub async fn process_css_with_placeholder(
                 exports,
                 references: *references,
                 url_references: *url_references,
-                placeholders: HashMap::new(),
+                placeholders: FxHashMap::default(),
             }
             .cell())
         }
@@ -221,6 +220,7 @@ pub async fn process_css_with_placeholder(
 #[turbo_tasks::function]
 pub async fn finalize_css(
     result: Vc<CssWithPlaceholderResult>,
+    module_graph: Vc<ModuleGraph>,
     chunking_context: Vc<Box<dyn ChunkingContext>>,
     minify_type: MinifyType,
 ) -> Result<Vc<FinalCssResult>> {
@@ -244,10 +244,11 @@ pub async fn finalize_css(
 
             let url_references = *url_references;
 
-            let mut url_map = HashMap::new();
+            let mut url_map = FxHashMap::default();
 
             for (src, reference) in (*url_references.await?).iter() {
-                let resolved = resolve_url_reference(**reference, chunking_context).await?;
+                let resolved =
+                    resolve_url_reference(**reference, module_graph, chunking_context).await?;
                 if let Some(v) = resolved.as_ref().cloned() {
                     url_map.insert(RcStr::from(src.as_str()), v);
                 }
@@ -285,6 +286,7 @@ pub trait ProcessCss: ParseCss {
 
     async fn finalize_css(
         self: Vc<Self>,
+        module_graph: Vc<ModuleGraph>,
         chunking_context: Vc<Box<dyn ChunkingContext>>,
         minify_type: MinifyType,
     ) -> Result<Vc<FinalCssResult>>;
@@ -292,7 +294,7 @@ pub trait ProcessCss: ParseCss {
 
 #[turbo_tasks::function]
 pub async fn parse_css(
-    source: Vc<Box<dyn Source>>,
+    source: ResolvedVc<Box<dyn Source>>,
     origin: Vc<Box<dyn ResolveOrigin>>,
     import_context: Vc<ImportContext>,
     ty: CssModuleAssetType,
@@ -337,7 +339,7 @@ async fn process_content(
     code: String,
     fs_path_vc: ResolvedVc<FileSystemPath>,
     filename: &str,
-    source: Vc<Box<dyn Source>>,
+    source: ResolvedVc<Box<dyn Source>>,
     origin: Vc<Box<dyn ResolveOrigin>>,
     import_context: Vc<ImportContext>,
     ty: CssModuleAssetType,
@@ -414,11 +416,7 @@ async fn process_content(
                                         line: loc.line as _,
                                         column: loc.column as _,
                                     };
-                                    Some(
-                                        IssueSource::from_line_col(source, pos, pos)
-                                            .to_resolved()
-                                            .await?,
-                                    )
+                                    Some(IssueSource::from_line_col(source, pos, pos))
                                 }
                                 None => None,
                             };
@@ -448,11 +446,7 @@ async fn process_content(
                             line: loc.line as _,
                             column: loc.column as _,
                         };
-                        Some(
-                            IssueSource::from_line_col(source, pos, pos)
-                                .to_resolved()
-                                .await?,
-                        )
+                        Some(IssueSource::from_line_col(source, pos, pos))
                     }
                     None => None,
                 };
@@ -679,7 +673,7 @@ impl GenerateSourceMap for ParseCssResultSourceMap {
 struct ParsingIssue {
     msg: ResolvedVc<RcStr>,
     file: ResolvedVc<FileSystemPath>,
-    source: Option<ResolvedVc<IssueSource>>,
+    source: Option<IssueSource>,
 }
 
 #[turbo_tasks::value_impl]
@@ -701,8 +695,8 @@ impl Issue for ParsingIssue {
 
     #[turbo_tasks::function]
     async fn source(&self) -> Result<Vc<OptionIssueSource>> {
-        Ok(Vc::cell(match self.source {
-            Some(s) => Some(s.resolve_source_map(*self.file).to_resolved().await?),
+        Ok(Vc::cell(match &self.source {
+            Some(s) => Some(s.resolve_source_map(*self.file).await?.into_owned()),
             None => None,
         }))
     }

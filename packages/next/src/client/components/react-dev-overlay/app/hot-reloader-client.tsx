@@ -23,9 +23,9 @@ import {
   useErrorOverlayReducer,
 } from '../shared'
 import { parseStack } from '../internal/helpers/parse-stack'
-import ReactDevOverlay from './ReactDevOverlay'
-import { useErrorHandler } from '../internal/helpers/use-error-handler'
-import { RuntimeErrorHandler } from '../internal/helpers/runtime-error-handler'
+import ReactDevOverlay from './react-dev-overlay'
+import { useErrorHandler } from '../../errors/use-error-handler'
+import { RuntimeErrorHandler } from '../../errors/runtime-error-handler'
 import {
   useSendMessage,
   useTurbopack,
@@ -41,12 +41,13 @@ import type {
 } from '../../../../server/dev/hot-reloader-types'
 import { extractModulesFromTurbopackMessage } from '../../../../server/dev/extract-modules-from-turbopack-message'
 import { REACT_REFRESH_FULL_RELOAD_FROM_ERROR } from '../shared'
-import type { HydrationErrorState } from '../internal/helpers/hydration-error-info'
+import type { HydrationErrorState } from '../../errors/hydration-error-info'
 import type { DebugInfo } from '../types'
 import { useUntrackedPathname } from '../../navigation-untracked'
-import { getReactStitchedError } from '../internal/helpers/stitched-error'
+import { getReactStitchedError } from '../../errors/stitched-error'
 import { shouldRenderRootLevelErrorOverlay } from '../../../lib/is-error-thrown-while-rendering-rsc'
 import { handleDevBuildIndicatorHmrEvents } from '../../../dev/dev-build-indicator/internal/handle-dev-build-indicator-hmr-events'
+import type { GlobalErrorComponent } from '../../error-boundary'
 
 export interface Dispatcher {
   onBuildOk(): void
@@ -335,7 +336,10 @@ function processMessage(
 
   switch (obj.action) {
     case HMR_ACTIONS_SENT_TO_BROWSER.APP_ISR_MANIFEST: {
-      if (process.env.__NEXT_APP_ISR_INDICATOR) {
+      if (
+        process.env.__NEXT_APP_ISR_INDICATOR ||
+        process.env.__NEXT_EXPERIMENTAL_NEW_DEV_OVERLAY
+      ) {
         if (appIsrManifestRef) {
           appIsrManifestRef.current = obj.data
 
@@ -344,18 +348,22 @@ function processMessage(
           // as we'll receive the updated manifest before usePathname
           // triggers for new value
           if ((pathnameRef.current as string) in obj.data) {
-            // the indicator can be hidden for an hour.
-            // check if it's still hidden
-            const indicatorHiddenAt = Number(
-              localStorage?.getItem('__NEXT_DISMISS_PRERENDER_INDICATOR')
-            )
+            if (process.env.__NEXT_APP_ISR_INDICATOR) {
+              // the indicator can be hidden for an hour.
+              // check if it's still hidden
+              const indicatorHiddenAt = Number(
+                localStorage?.getItem('__NEXT_DISMISS_PRERENDER_INDICATOR')
+              )
 
-            const isHidden =
-              indicatorHiddenAt &&
-              !isNaN(indicatorHiddenAt) &&
-              Date.now() < indicatorHiddenAt
+              const isHidden =
+                indicatorHiddenAt &&
+                !isNaN(indicatorHiddenAt) &&
+                Date.now() < indicatorHiddenAt
 
-            if (!isHidden) {
+              if (!isHidden) {
+                dispatcher.onStaticIndicator(true)
+              }
+            } else if (process.env.__NEXT_EXPERIMENTAL_NEW_DEV_OVERLAY) {
               dispatcher.onStaticIndicator(true)
             }
           } else {
@@ -473,13 +481,20 @@ function processMessage(
         JSON.stringify({
           event: 'server-component-reload-page',
           clientId: __nextDevClientId,
+          hash: obj.hash,
         })
       )
+
+      // Store the latest hash in a session cookie so that it's sent back to the
+      // server with any subsequent requests.
+      document.cookie = `__next_hmr_refresh_hash__=${obj.hash}`
+
       if (RuntimeErrorHandler.hadRuntimeError) {
         if (reloading) return
         reloading = true
         return window.location.reload()
       }
+
       startTransition(() => {
         router.hmrRefresh()
         dispatcher.onRefresh()
@@ -531,9 +546,11 @@ function processMessage(
 export default function HotReload({
   assetPrefix,
   children,
+  globalError,
 }: {
   assetPrefix: string
-  children?: ReactNode
+  children: ReactNode
+  globalError: [GlobalErrorComponent, React.ReactNode]
 }) {
   const [state, dispatch] = useErrorOverlayReducer()
 
@@ -625,7 +642,10 @@ export default function HotReload({
   const appIsrManifestRef = useRef<Record<string, false | number>>({})
   const pathnameRef = useRef(pathname)
 
-  if (process.env.__NEXT_APP_ISR_INDICATOR) {
+  if (
+    process.env.__NEXT_APP_ISR_INDICATOR ||
+    process.env.__NEXT_EXPERIMENTAL_NEW_DEV_OVERLAY
+  ) {
     // this conditional is only for dead-code elimination which
     // isn't a runtime conditional only build-time so ignore hooks rule
     // eslint-disable-next-line react-hooks/rules-of-hooks
@@ -637,16 +657,20 @@ export default function HotReload({
       if (appIsrManifest) {
         if (pathname && pathname in appIsrManifest) {
           try {
-            const indicatorHiddenAt = Number(
-              localStorage?.getItem('__NEXT_DISMISS_PRERENDER_INDICATOR')
-            )
+            if (process.env.__NEXT_APP_ISR_INDICATOR) {
+              const indicatorHiddenAt = Number(
+                localStorage?.getItem('__NEXT_DISMISS_PRERENDER_INDICATOR')
+              )
 
-            const isHidden =
-              indicatorHiddenAt &&
-              !isNaN(indicatorHiddenAt) &&
-              Date.now() < indicatorHiddenAt
+              const isHidden =
+                indicatorHiddenAt &&
+                !isNaN(indicatorHiddenAt) &&
+                Date.now() < indicatorHiddenAt
 
-            if (!isHidden) {
+              if (!isHidden) {
+                dispatcher.onStaticIndicator(true)
+              }
+            } else if (process.env.__NEXT_EXPERIMENTAL_NEW_DEV_OVERLAY) {
               dispatcher.onStaticIndicator(true)
             }
           } catch (reason) {
@@ -710,7 +734,11 @@ export default function HotReload({
 
   if (shouldRenderErrorOverlay) {
     return (
-      <ReactDevOverlay state={state} dispatcher={dispatcher}>
+      <ReactDevOverlay
+        state={state}
+        dispatcher={dispatcher}
+        globalError={globalError}
+      >
         {children}
       </ReactDevOverlay>
     )

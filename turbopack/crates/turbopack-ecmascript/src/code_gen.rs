@@ -1,11 +1,24 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use swc_core::ecma::{
     ast::Stmt,
     visit::{AstParentKind, VisitMut},
 };
 use turbo_rcstr::RcStr;
-use turbo_tasks::{debug::ValueDebugFormat, trace::TraceRawVcs, ResolvedVc, Vc};
-use turbopack_core::chunk::{AsyncModuleInfo, ChunkingContext};
+use turbo_tasks::{debug::ValueDebugFormat, trace::TraceRawVcs, NonLocalValue, Vc};
+use turbopack_core::{chunk::ChunkingContext, module_graph::ModuleGraph};
+
+use crate::references::{
+    amd::AmdDefineWithDependenciesCodeGen,
+    cjs::CjsRequireCacheAccess,
+    constant_condition::ConstantConditionCodeGen,
+    constant_value::ConstantValueCodeGen,
+    dynamic_expression::DynamicExpression,
+    esm::{EsmBinding, EsmModuleItem, ImportMetaBinding, ImportMetaRef},
+    ident::IdentReplacement,
+    member::MemberReplacement,
+    unreachable::Unreachable,
+};
 
 /// impl of code generation inferred from a ModuleReference.
 /// This is rust only and can't be implemented by non-rust plugins.
@@ -37,37 +50,33 @@ impl CodeGeneration {
         visitors: Vec<(Vec<AstParentKind>, Box<dyn VisitorFactory>)>,
         hoisted_stmts: Vec<CodeGenerationHoistedStmt>,
         early_hoisted_stmts: Vec<CodeGenerationHoistedStmt>,
-    ) -> Vc<Self> {
+    ) -> Self {
         CodeGeneration {
             visitors,
             hoisted_stmts,
             early_hoisted_stmts,
         }
-        .cell()
     }
 
-    pub fn visitors(visitors: Vec<(Vec<AstParentKind>, Box<dyn VisitorFactory>)>) -> Vc<Self> {
+    pub fn visitors(visitors: Vec<(Vec<AstParentKind>, Box<dyn VisitorFactory>)>) -> Self {
         CodeGeneration {
             visitors,
             ..Default::default()
         }
-        .cell()
     }
 
-    pub fn hoisted_stmt(key: RcStr, stmt: Stmt) -> Vc<Self> {
+    pub fn hoisted_stmt(key: RcStr, stmt: Stmt) -> Self {
         CodeGeneration {
             hoisted_stmts: vec![CodeGenerationHoistedStmt::new(key, stmt)],
             ..Default::default()
         }
-        .cell()
     }
 
-    pub fn hoisted_stmts(hoisted_stmts: Vec<CodeGenerationHoistedStmt>) -> Vc<Self> {
+    pub fn hoisted_stmts(hoisted_stmts: Vec<CodeGenerationHoistedStmt>) -> Self {
         CodeGeneration {
             hoisted_stmts,
             ..Default::default()
         }
-        .cell()
     }
 }
 
@@ -89,31 +98,56 @@ pub trait VisitorFactory: Send + Sync {
     fn create<'a>(&'a self) -> Box<dyn VisitMut + Send + Sync + 'a>;
 }
 
-#[turbo_tasks::value_trait(local)]
+#[turbo_tasks::value_trait]
 pub trait CodeGenerateable {
     fn code_generation(
         self: Vc<Self>,
+        module_graph: Vc<ModuleGraph>,
         chunking_context: Vc<Box<dyn ChunkingContext>>,
     ) -> Vc<CodeGeneration>;
 }
 
-#[turbo_tasks::value_trait]
-pub trait CodeGenerateableWithAsyncModuleInfo {
-    fn code_generation(
-        self: Vc<Self>,
-        chunking_context: Vc<Box<dyn ChunkingContext>>,
-        async_module_info: Option<Vc<AsyncModuleInfo>>,
-    ) -> Vc<CodeGeneration>;
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TraceRawVcs, ValueDebugFormat)]
+#[derive(PartialEq, Eq, Serialize, Deserialize, TraceRawVcs, ValueDebugFormat, NonLocalValue)]
 pub enum CodeGen {
-    CodeGenerateable(Vc<Box<dyn CodeGenerateable>>),
-    CodeGenerateableWithAsyncModuleInfo(ResolvedVc<Box<dyn CodeGenerateableWithAsyncModuleInfo>>),
+    AmdDefineWithDependenciesCodeGen(AmdDefineWithDependenciesCodeGen),
+    CjsRequireCacheAccess(CjsRequireCacheAccess),
+    ConstantConditionCodeGen(ConstantConditionCodeGen),
+    ConstantValueCodeGen(ConstantValueCodeGen),
+    DynamicExpression(DynamicExpression),
+    EsmBinding(EsmBinding),
+    EsmModuleItem(EsmModuleItem),
+    IdentReplacement(IdentReplacement),
+    ImportMetaBinding(ImportMetaBinding),
+    ImportMetaRef(ImportMetaRef),
+    MemberReplacement(MemberReplacement),
+    Unreachable(Unreachable),
 }
 
-#[turbo_tasks::value(transparent, local)]
-pub struct CodeGenerateables(Vec<CodeGen>);
+impl CodeGen {
+    pub async fn code_generation(
+        &self,
+        g: Vc<ModuleGraph>,
+        ctx: Vc<Box<dyn ChunkingContext>>,
+    ) -> Result<CodeGeneration> {
+        match self {
+            Self::AmdDefineWithDependenciesCodeGen(v) => v.code_generation(g, ctx).await,
+            Self::CjsRequireCacheAccess(v) => v.code_generation(g, ctx).await,
+            Self::ConstantConditionCodeGen(v) => v.code_generation(g, ctx).await,
+            Self::ConstantValueCodeGen(v) => v.code_generation(g, ctx).await,
+            Self::DynamicExpression(v) => v.code_generation(g, ctx).await,
+            Self::EsmBinding(v) => v.code_generation(g, ctx).await,
+            Self::EsmModuleItem(v) => v.code_generation(g, ctx).await,
+            Self::IdentReplacement(v) => v.code_generation(g, ctx).await,
+            Self::ImportMetaBinding(v) => v.code_generation(g, ctx).await,
+            Self::ImportMetaRef(v) => v.code_generation(g, ctx).await,
+            Self::MemberReplacement(v) => v.code_generation(g, ctx).await,
+            Self::Unreachable(v) => v.code_generation(g, ctx).await,
+        }
+    }
+}
+
+#[turbo_tasks::value(transparent)]
+pub struct CodeGens(Vec<CodeGen>);
 
 pub fn path_to(
     path: &[AstParentKind],

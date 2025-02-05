@@ -10,6 +10,7 @@ use turbopack_core::{
     chunk::{ChunkItem, ChunkItemExt, ChunkType, ChunkableModule, ChunkingContext},
     ident::AssetIdent,
     module::Module,
+    module_graph::ModuleGraph,
     reference::ModuleReferences,
 };
 use turbopack_ecmascript::{
@@ -18,6 +19,7 @@ use turbopack_ecmascript::{
         EcmascriptChunkType, EcmascriptExports,
     },
     references::esm::{EsmExport, EsmExports},
+    runtime_functions::{TURBOPACK_EXPORT_NAMESPACE, TURBOPACK_IMPORT},
     utils::StringifyJs,
 };
 
@@ -76,10 +78,12 @@ impl ChunkableModule for NextServerUtilityModule {
     #[turbo_tasks::function]
     fn as_chunk_item(
         self: ResolvedVc<Self>,
+        module_graph: ResolvedVc<ModuleGraph>,
         chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
     ) -> Vc<Box<dyn turbopack_core::chunk::ChunkItem>> {
         Vc::upcast(
             NextServerComponentChunkItem {
+                module_graph,
                 chunking_context,
                 inner: self,
             }
@@ -92,9 +96,11 @@ impl ChunkableModule for NextServerUtilityModule {
 impl EcmascriptChunkPlaceable for NextServerUtilityModule {
     #[turbo_tasks::function]
     async fn get_exports(&self) -> Result<Vc<EcmascriptExports>> {
-        let module_reference = Vc::upcast(NextServerUtilityModuleReference::new(Vc::upcast(
-            *self.module,
-        )));
+        let module_reference = ResolvedVc::upcast(
+            NextServerUtilityModuleReference::new(Vc::upcast(*self.module))
+                .to_resolved()
+                .await?,
+        );
 
         let mut exports = BTreeMap::new();
         exports.insert(
@@ -105,7 +111,7 @@ impl EcmascriptChunkPlaceable for NextServerUtilityModule {
         Ok(EcmascriptExports::EsmExports(
             EsmExports {
                 exports,
-                star_exports: vec![module_reference.to_resolved().await?],
+                star_exports: vec![module_reference],
             }
             .resolved_cell(),
         )
@@ -115,6 +121,7 @@ impl EcmascriptChunkPlaceable for NextServerUtilityModule {
 
 #[turbo_tasks::value]
 struct NextServerComponentChunkItem {
+    module_graph: ResolvedVc<ModuleGraph>,
     chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
     inner: ResolvedVc<NextServerUtilityModule>,
 }
@@ -132,14 +139,12 @@ impl EcmascriptChunkItem for NextServerComponentChunkItem {
 
         let module_id = inner
             .module
-            .as_chunk_item(Vc::upcast(*self.chunking_context))
+            .as_chunk_item(*self.module_graph, Vc::upcast(*self.chunking_context))
             .id()
             .await?;
         Ok(EcmascriptChunkItemContent {
             inner_code: formatdoc!(
-                r#"
-                    __turbopack_export_namespace__(__turbopack_import__({}));
-                "#,
+                "{TURBOPACK_EXPORT_NAMESPACE}({TURBOPACK_IMPORT}({}));",
                 StringifyJs(&module_id),
             )
             .into(),

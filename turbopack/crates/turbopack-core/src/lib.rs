@@ -6,6 +6,7 @@
 #![feature(arbitrary_self_types_pointers)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(iter_intersperse)]
+#![feature(map_many_mut)]
 
 pub mod asset;
 pub mod changed;
@@ -38,6 +39,7 @@ pub mod source_map;
 pub mod source_pos;
 pub mod source_transform;
 pub mod target;
+pub mod traced_asset;
 mod utils;
 pub mod version;
 pub mod virtual_output;

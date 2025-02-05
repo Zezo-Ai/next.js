@@ -24,6 +24,7 @@ use turbopack_core::{
     ident::AssetIdent,
     issue::IssueSource,
     module::Module,
+    module_graph::ModuleGraph,
     reference::{ModuleReference, ModuleReferences},
     resolve::{origin::ResolveOrigin, parse::Request, ModuleResolveResult},
     source::Source,
@@ -40,6 +41,7 @@ use crate::{
         pattern_mapping::{PatternMapping, ResolveType},
         AstPath,
     },
+    runtime_functions::{TURBOPACK_EXPORT_VALUE, TURBOPACK_MODULE_CONTEXT, TURBOPACK_REQUIRE},
     utils::module_id_to_lit,
     CodeGenerateable, EcmascriptChunkPlaceable,
 };
@@ -166,7 +168,7 @@ impl RequireContextMap {
         dir: Vc<FileSystemPath>,
         recursive: bool,
         filter: Vc<Regex>,
-        issue_source: Option<ResolvedVc<IssueSource>>,
+        issue_source: Option<IssueSource>,
         is_optional: bool,
     ) -> Result<Vc<Self>> {
         let origin_path = &*origin.origin_path().parent().await?;
@@ -180,7 +182,7 @@ impl RequireContextMap {
                 let request = Request::parse(Value::new(origin_relative.clone().into()))
                     .to_resolved()
                     .await?;
-                let result = cjs_resolve(origin, *request, issue_source.map(|v| *v), is_optional)
+                let result = cjs_resolve(origin, *request, issue_source.clone(), is_optional)
                     .to_resolved()
                     .await?;
 
@@ -211,7 +213,7 @@ pub struct RequireContextAssetReference {
     pub include_subdirs: bool,
 
     pub path: ResolvedVc<AstPath>,
-    pub issue_source: Option<ResolvedVc<IssueSource>>,
+    pub issue_source: Option<IssueSource>,
     pub in_try: bool,
 }
 
@@ -225,7 +227,7 @@ impl RequireContextAssetReference {
         include_subdirs: bool,
         filter: Vc<Regex>,
         path: ResolvedVc<AstPath>,
-        issue_source: Option<ResolvedVc<IssueSource>>,
+        issue_source: Option<IssueSource>,
         in_try: bool,
     ) -> Result<Vc<Self>> {
         let map = RequireContextMap::generate(
@@ -233,7 +235,7 @@ impl RequireContextAssetReference {
             origin.origin_path().parent().join(dir.clone()),
             include_subdirs,
             filter,
-            issue_source.map(|v| *v),
+            issue_source.clone(),
             in_try,
         )
         .to_resolved()
@@ -290,9 +292,12 @@ impl CodeGenerateable for RequireContextAssetReference {
     #[turbo_tasks::function]
     async fn code_generation(
         &self,
+        module_graph: Vc<ModuleGraph>,
         chunking_context: Vc<Box<dyn ChunkingContext>>,
     ) -> Result<Vc<CodeGeneration>> {
-        let chunk_item = self.inner.as_chunk_item(Vc::upcast(chunking_context));
+        let chunk_item = self
+            .inner
+            .as_chunk_item(module_graph, Vc::upcast(chunking_context));
         let module_id = chunk_item.id().await?.clone_value();
 
         let mut visitors = Vec::new();
@@ -301,13 +306,15 @@ impl CodeGenerateable for RequireContextAssetReference {
         visitors.push(create_visitor!(path, visit_mut_expr(expr: &mut Expr) {
             if let Expr::Call(_) = expr {
                 *expr = quote!(
-                    "__turbopack_module_context__(__turbopack_require__($id))" as Expr,
+                    "$turbopack_module_context($turbopack_require($id))" as Expr,
+                    turbopack_module_context: Expr = TURBOPACK_MODULE_CONTEXT.into(),
+                    turbopack_require: Expr = TURBOPACK_REQUIRE.into(),
                     id: Expr = module_id_to_lit(&module_id)
                 );
             }
         }));
 
-        Ok(CodeGeneration::visitors(visitors))
+        Ok(CodeGeneration::visitors(visitors).cell())
     }
 }
 
@@ -392,11 +399,13 @@ impl ChunkableModule for RequireContextAsset {
     #[turbo_tasks::function]
     async fn as_chunk_item(
         self: ResolvedVc<Self>,
+        module_graph: ResolvedVc<ModuleGraph>,
         chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
     ) -> Result<Vc<Box<dyn turbopack_core::chunk::ChunkItem>>> {
         let this = self.await?;
         Ok(Vc::upcast(
             RequireContextChunkItem {
+                module_graph,
                 chunking_context,
                 inner: self,
 
@@ -418,6 +427,7 @@ impl EcmascriptChunkPlaceable for RequireContextAsset {
 
 #[turbo_tasks::value]
 pub struct RequireContextChunkItem {
+    module_graph: ResolvedVc<ModuleGraph>,
     chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
     inner: ResolvedVc<RequireContextAsset>,
 
@@ -445,9 +455,10 @@ impl EcmascriptChunkItem for RequireContextChunkItem {
             let pm = PatternMapping::resolve_request(
                 *entry.request,
                 *self.origin,
+                *self.module_graph,
                 *ResolvedVc::upcast(self.chunking_context),
                 *entry.result,
-                Value::new(ResolveType::ChunkItem),
+                ResolveType::ChunkItem,
             )
             .await?;
 
@@ -474,7 +485,8 @@ impl EcmascriptChunkItem for RequireContextChunkItem {
         }
 
         let expr = quote_expr!(
-            "__turbopack_export_value__($obj);",
+            "$turbopack_export_value($obj);",
+            turbopack_export_value: Expr = TURBOPACK_EXPORT_VALUE.into(),
             obj: Expr = Expr::Object(context_map),
         );
 

@@ -5,6 +5,10 @@ import {
   getRedboxSource,
 } from 'next-test-utils'
 
+// Enabling PPR testing also enables the new dev overlay.
+const isNewDevOverlay =
+  process.env.__NEXT_EXPERIMENTAL_NEW_DEV_OVERLAY === 'true'
+
 describe('app-dir - server-component-next-dynamic-ssr-false', () => {
   const { next } = nextTestSetup({
     files: __dirname,
@@ -19,34 +23,69 @@ describe('app-dir - server-component-next-dynamic-ssr-false', () => {
     }
 
     expect(redbox.description).toBe('Failed to compile')
-    if (process.env.TURBOPACK) {
-      expect(redbox.source).toMatchInlineSnapshot(`
-        "./app/page.js:3:23
-        Ecmascript file had an error
+
+    // TODO(jiwon): Remove this once we have a new dev overlay at stable.
+    if (isNewDevOverlay) {
+      if (process.env.TURBOPACK) {
+        expect(redbox.source).toMatchInlineSnapshot(`
+                "./app/page.js (3:23)
+
+                Ecmascript file had an error
+                  1 | import dynamic from 'next/dynamic'
+                  2 |
+                > 3 | const DynamicClient = dynamic(() => import('./client'), { ssr: false })
+                    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                  4 |
+                  5 | export default function Page() {
+                  6 |   return <DynamicClient />
+
+                \`ssr: false\` is not allowed with \`next/dynamic\` in Server Components. Please move it into a client component."
+              `)
+      } else {
+        expect(redbox.source).toMatchInlineSnapshot(`
+         "./app/page.js
+         Error:   x \`ssr: false\` is not allowed with \`next/dynamic\` in Server Components. Please move it into a client component.
+            ,-[3:1]
           1 | import dynamic from 'next/dynamic'
-          2 |
-        > 3 | const DynamicClient = dynamic(() => import('./client'), { ssr: false })
-            |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-          4 |
+          2 | 
+          3 | const DynamicClient = dynamic(() => import('./client'), { ssr: false })
+            :                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+          4 | 
           5 | export default function Page() {
           6 |   return <DynamicClient />
-
-        \`ssr: false\` is not allowed with \`next/dynamic\` in Server Components. Please move it into a client component."
-      `)
+            \`----"
+        `)
+      }
     } else {
-      expect(redbox.source).toMatchInlineSnapshot(`
-        "./app/page.js
-        Error:   x \`ssr: false\` is not allowed with \`next/dynamic\` in Server Components. Please move it into a client component.
-           ,-[3:1]
-         1 | import dynamic from 'next/dynamic'
-         2 | 
-         3 | const DynamicClient = dynamic(() => import('./client'), { ssr: false })
-           :                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-         4 | 
-         5 | export default function Page() {
-         6 |   return <DynamicClient />
-           \`----"
-      `)
+      if (process.env.TURBOPACK) {
+        expect(redbox.source).toMatchInlineSnapshot(`
+                 "./app/page.js:3:23
+                 Ecmascript file had an error
+                   1 | import dynamic from 'next/dynamic'
+                   2 |
+                 > 3 | const DynamicClient = dynamic(() => import('./client'), { ssr: false })
+                     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                   4 |
+                   5 | export default function Page() {
+                   6 |   return <DynamicClient />
+
+                 \`ssr: false\` is not allowed with \`next/dynamic\` in Server Components. Please move it into a client component."
+              `)
+      } else {
+        expect(redbox.source).toMatchInlineSnapshot(`
+                 "./app/page.js
+                 Error:   x \`ssr: false\` is not allowed with \`next/dynamic\` in Server Components. Please move it into a client component.
+                    ,-[3:1]
+                  1 | import dynamic from 'next/dynamic'
+                  2 | 
+                  3 | const DynamicClient = dynamic(() => import('./client'), { ssr: false })
+                    :                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                  4 | 
+                  5 | export default function Page() {
+                  6 |   return <DynamicClient />
+                    \`----"
+              `)
+      }
     }
   })
 })

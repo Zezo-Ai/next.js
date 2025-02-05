@@ -13,7 +13,7 @@ use turbopack_core::{
     version::{Version, VersionedContent},
 };
 use turbopack_ecmascript::{
-    chunk::{EcmascriptChunkContent, EcmascriptChunkItemExt},
+    chunk::{EcmascriptChunkContent, EcmascriptChunkItemExt, EcmascriptChunkItemWithAsyncInfo},
     minify::minify,
     utils::StringifyJs,
 };
@@ -52,12 +52,18 @@ pub(super) async fn chunk_items(
         .await?
         .chunk_items
         .iter()
-        .map(|&(chunk_item, async_module_info)| async move {
-            Ok((
-                chunk_item.id().await?,
-                chunk_item.code(async_module_info).await?,
-            ))
-        })
+        .map(
+            async |&EcmascriptChunkItemWithAsyncInfo {
+                       chunk_item,
+                       async_info,
+                       ..
+                   }| {
+                Ok((
+                    chunk_item.id().await?,
+                    chunk_item.code(async_info.map(|info| *info)).await?,
+                ))
+            },
+        )
         .try_join()
         .await
 }
@@ -67,7 +73,10 @@ impl EcmascriptBuildNodeChunkContent {
     #[turbo_tasks::function]
     async fn code(self: Vc<Self>) -> Result<Vc<Code>> {
         let this = self.await?;
-        let chunk_path_vc = this.chunk.ident().path();
+        let source_maps = this
+            .chunking_context
+            .reference_chunk_source_maps(*ResolvedVc::upcast(this.chunk));
+        let chunk_path_vc = this.chunk.path();
         let chunk_path = chunk_path_vc.await?;
 
         let mut code = CodeBuilder::default();
@@ -88,7 +97,7 @@ impl EcmascriptBuildNodeChunkContent {
 
         write!(code, "\n}};")?;
 
-        if code.has_source_map() {
+        if *source_maps.await? && code.has_source_map() {
             let filename = chunk_path.file_name();
             write!(
                 code,
@@ -102,7 +111,7 @@ impl EcmascriptBuildNodeChunkContent {
             this.chunking_context.await?.minify_type(),
             MinifyType::Minify
         ) {
-            return Ok(minify(chunk_path_vc, code));
+            return Ok(minify(chunk_path_vc, code, source_maps));
         }
 
         Ok(code)
@@ -112,7 +121,7 @@ impl EcmascriptBuildNodeChunkContent {
     pub(crate) async fn own_version(&self) -> Result<Vc<EcmascriptBuildNodeChunkVersion>> {
         Ok(EcmascriptBuildNodeChunkVersion::new(
             self.chunking_context.output_root(),
-            self.chunk.ident().path(),
+            self.chunk.path(),
             *self.content,
             self.chunking_context.await?.minify_type(),
         ))

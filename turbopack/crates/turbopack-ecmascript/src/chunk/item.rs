@@ -2,10 +2,12 @@ use std::io::Write;
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use turbo_tasks::{trace::TraceRawVcs, NonLocalValue, ResolvedVc, Upcast, ValueToString, Vc};
+use turbo_tasks::{
+    trace::TraceRawVcs, NonLocalValue, ResolvedVc, TaskInput, Upcast, ValueToString, Vc,
+};
 use turbo_tasks_fs::{rope::Rope, FileSystemPath};
 use turbopack_core::{
-    chunk::{AsyncModuleInfo, ChunkItem, ChunkItemExt, ChunkingContext},
+    chunk::{AsyncModuleInfo, ChunkItem, ChunkItemExt, ChunkItemTy, ChunkingContext},
     code_builder::{fileify_source_map, Code, CodeBuilder},
     error::PrettyPrintError,
     issue::{code_gen::CodeGenerationIssue, IssueExt, IssueSeverity, StyledString},
@@ -86,30 +88,12 @@ impl EcmascriptChunkItemContent {
     #[turbo_tasks::function]
     pub async fn module_factory(&self) -> Result<Vc<Code>> {
         let mut args = vec![
-            "r: __turbopack_require__",
-            "f: __turbopack_module_context__",
-            "i: __turbopack_import__",
-            "s: __turbopack_esm__",
-            "v: __turbopack_export_value__",
-            "n: __turbopack_export_namespace__",
-            "c: __turbopack_cache__",
-            "M: __turbopack_modules__",
-            "l: __turbopack_load__",
-            "j: __turbopack_dynamic__",
-            "P: __turbopack_resolve_absolute_path__",
-            "U: __turbopack_relative_url__",
-            "R: __turbopack_resolve_module_id_path__",
-            "b: __turbopack_worker_blob_url__",
             "g: global",
             // HACK
-            "__dirname",
+            "d: __dirname",
         ];
         if self.options.async_module.is_some() {
             args.push("a: __turbopack_async_module__");
-        }
-        if self.options.externals {
-            args.push("x: __turbopack_external_require__");
-            args.push("y: __turbopack_external_import__");
         }
         if self.options.refresh {
             args.push("k: __turbopack_refresh__");
@@ -119,11 +103,6 @@ impl EcmascriptChunkItemContent {
         }
         if self.options.exports {
             args.push("e: exports");
-        }
-        if self.options.stub_require {
-            args.push("z: __turbopack_require_stub__");
-        } else {
-            args.push("t: __turbopack_require_real__");
         }
         if self.options.wasm {
             args.push("w: __turbopack_wasm__");
@@ -209,6 +188,15 @@ pub struct EcmascriptChunkItemOptions {
     /// `__turbopack_wasm__` to load WebAssembly.
     pub wasm: bool,
     pub placeholder_for_future_extensions: (),
+}
+
+#[derive(
+    Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, TraceRawVcs, TaskInput, NonLocalValue,
+)]
+pub struct EcmascriptChunkItemWithAsyncInfo {
+    pub ty: ChunkItemTy,
+    pub chunk_item: ResolvedVc<Box<dyn EcmascriptChunkItem>>,
+    pub async_info: Option<ResolvedVc<AsyncModuleInfo>>,
 }
 
 #[turbo_tasks::value_trait]

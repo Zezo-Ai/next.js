@@ -382,7 +382,7 @@ async fn parse_file_content(
                 source_map: source_map.clone(),
             });
 
-            parsed_program.mutate(swc_core::ecma::lints::rules::lint_to_fold(rules));
+            parsed_program.mutate(swc_core::ecma::lints::rules::lint_pass(rules));
             drop(span);
 
             parsed_program.mutate(swc_core::ecma::transforms::proposal::explicit_resource_management::explicit_resource_management());
@@ -434,7 +434,7 @@ async fn parse_file_content(
                 unresolved_mark,
                 top_level_mark,
                 Some(&comments),
-                Some(*source),
+                Some(source),
             );
 
             Ok::<ParseResult, anyhow::Error>(ParseResult::Ok {

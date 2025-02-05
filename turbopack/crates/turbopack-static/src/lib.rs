@@ -24,6 +24,7 @@ use turbopack_core::{
     context::AssetContext,
     ident::AssetIdent,
     module::Module,
+    module_graph::ModuleGraph,
     output::{OutputAsset, OutputAssets},
     source::Source,
 };
@@ -33,6 +34,7 @@ use turbopack_ecmascript::{
         EcmascriptChunkItem, EcmascriptChunkItemContent, EcmascriptChunkPlaceable,
         EcmascriptChunkType, EcmascriptExports,
     },
+    runtime_functions::TURBOPACK_EXPORT_VALUE,
     utils::StringifyJs,
 };
 
@@ -96,6 +98,7 @@ impl ChunkableModule for StaticModuleAsset {
     #[turbo_tasks::function]
     async fn as_chunk_item(
         self: ResolvedVc<Self>,
+        _module_graph: Vc<ModuleGraph>,
         chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
     ) -> Result<Vc<Box<dyn turbopack_core::chunk::ChunkItem>>> {
         Ok(Vc::upcast(ModuleChunkItem::cell(ModuleChunkItem {
@@ -165,11 +168,11 @@ impl EcmascriptChunkItem for ModuleChunkItem {
     async fn content(&self) -> Result<Vc<EcmascriptChunkItemContent>> {
         Ok(EcmascriptChunkItemContent {
             inner_code: format!(
-                "__turbopack_export_value__({path});",
+                "{TURBOPACK_EXPORT_VALUE}({path});",
                 path = StringifyJs(
                     &self
                         .chunking_context
-                        .asset_url(self.static_asset.ident())
+                        .asset_url(self.static_asset.path())
                         .await?
                 )
             )

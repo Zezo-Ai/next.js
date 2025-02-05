@@ -21,6 +21,7 @@ dunce = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
 once_cell = { workspace = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 testing = { workspace = true }
@@ -30,7 +31,7 @@ turbo-tasks = { workspace = true }
 turbo-tasks-bytes = { workspace = true }
 turbo-tasks-env = { workspace = true }
 turbo-tasks-fs = { workspace = true }
-turbo-tasks-memory = { workspace = true }
+turbo-tasks-backend = { workspace = true }
 turbopack-browser = { workspace = true, features = ["test"] }
 turbopack-cli-utils = { workspace = true }
 turbopack-core = { workspace = true, features = ["issue_path"] }

@@ -1,10 +1,13 @@
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
 use swc_core::{
     ecma::ast::{Expr, ExprOrSpread, NewExpr},
     quote,
 };
 use turbo_rcstr::RcStr;
-use turbo_tasks::{ResolvedVc, Value, ValueToString, Vc};
+use turbo_tasks::{
+    trace::TraceRawVcs, NonLocalValue, ResolvedVc, TaskInput, Value, ValueToString, Vc,
+};
 use turbopack_core::{
     chunk::{
         ChunkItemExt, ChunkableModule, ChunkableModuleReference, ChunkingContext, ChunkingType,
@@ -12,6 +15,7 @@ use turbopack_core::{
     },
     environment::Rendering,
     issue::IssueSource,
+    module_graph::ModuleGraph,
     reference::ModuleReference,
     reference_type::{ReferenceType, UrlReferenceSubType},
     resolve::{
@@ -24,14 +28,28 @@ use crate::{
     code_gen::{CodeGenerateable, CodeGeneration},
     create_visitor,
     references::AstPath,
+    runtime_functions::{
+        TURBOPACK_RELATIVE_URL, TURBOPACK_REQUIRE, TURBOPACK_RESOLVE_MODULE_ID_PATH,
+    },
     utils::module_id_to_lit,
 };
 
 /// Determines how to treat `new URL(...)` rewrites.
 /// This allows to construct url depends on the different building context,
 /// e.g. SSR, CSR, or Node.js.
-#[turbo_tasks::value(shared)]
-#[derive(Debug, Copy, Clone, Hash)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    Serialize,
+    Deserialize,
+    TraceRawVcs,
+    TaskInput,
+    NonLocalValue,
+)]
 pub enum UrlRewriteBehavior {
     /// Omits base, resulting in a relative URL.
     Relative,
@@ -52,9 +70,9 @@ pub struct UrlAssetReference {
     request: ResolvedVc<Request>,
     rendering: ResolvedVc<Rendering>,
     ast_path: ResolvedVc<AstPath>,
-    issue_source: ResolvedVc<IssueSource>,
+    issue_source: IssueSource,
     in_try: bool,
-    url_rewrite_behavior: ResolvedVc<UrlRewriteBehavior>,
+    url_rewrite_behavior: UrlRewriteBehavior,
 }
 
 #[turbo_tasks::value_impl]
@@ -65,9 +83,9 @@ impl UrlAssetReference {
         request: ResolvedVc<Request>,
         rendering: ResolvedVc<Rendering>,
         ast_path: ResolvedVc<AstPath>,
-        issue_source: ResolvedVc<IssueSource>,
+        issue_source: IssueSource,
         in_try: bool,
-        url_rewrite_behavior: ResolvedVc<UrlRewriteBehavior>,
+        url_rewrite_behavior: UrlRewriteBehavior,
     ) -> Vc<Self> {
         UrlAssetReference {
             origin,
@@ -95,7 +113,7 @@ impl ModuleReference for UrlAssetReference {
             *self.origin,
             *self.request,
             Value::new(ReferenceType::Url(UrlReferenceSubType::EcmaScriptNewUrl)),
-            Some(*self.issue_source),
+            Some(self.issue_source.clone()),
             self.in_try,
         )
     }
@@ -141,13 +159,13 @@ impl CodeGenerateable for UrlAssetReference {
     #[turbo_tasks::function]
     async fn code_generation(
         self: Vc<Self>,
+        module_graph: Vc<ModuleGraph>,
         chunking_context: Vc<Box<dyn ChunkingContext>>,
     ) -> Result<Vc<CodeGeneration>> {
         let this = self.await?;
         let mut visitors = vec![];
-        let rewrite_behavior = &*this.url_rewrite_behavior.await?;
 
-        match rewrite_behavior {
+        match this.url_rewrite_behavior {
             UrlRewriteBehavior::Relative => {
                 let referenced_asset = self.get_referenced_asset().await?;
                 let ast_path = this.ast_path.await?;
@@ -163,7 +181,7 @@ impl CodeGenerateable for UrlAssetReference {
                         // We rewrite the first `new URL()` arguments to be a require() of the chunk
                         // item, which exports the static asset path to the linked file.
                         let id = asset
-                            .as_chunk_item(Vc::upcast(chunking_context))
+                            .as_chunk_item(module_graph, Vc::upcast(chunking_context))
                             .id()
                             .await?;
 
@@ -176,7 +194,9 @@ impl CodeGenerateable for UrlAssetReference {
 
                             if should_rewrite_to_relative {
                                 *new_expr = quote!(
-                                    "new __turbopack_relative_url__(__turbopack_require__($id))" as Expr,
+                                    "new $turbopack_relative_url($turbopack_require($id))" as Expr,
+                                    turbopack_relative_url: Expr = TURBOPACK_RELATIVE_URL.into(),
+                                    turbopack_require: Expr = TURBOPACK_REQUIRE.into(),
                                     id: Expr = module_id_to_lit(&id),
                                 );
                             }
@@ -193,7 +213,8 @@ impl CodeGenerateable for UrlAssetReference {
 
                             if should_rewrite_to_relative {
                                 *new_expr = quote!(
-                                    "new __turbopack_relative_url__($id)" as Expr,
+                                    "new $turbopack_relative_url($id)" as Expr,
+                                    turbopack_relative_url: Expr = TURBOPACK_RELATIVE_URL.into(),
                                     id: Expr = request.as_str().into(),
                                 );
                             }
@@ -229,7 +250,7 @@ impl CodeGenerateable for UrlAssetReference {
                         // We rewrite the first `new URL()` arguments to be a require() of the
                         // chunk item, which returns the asset path as its exports.
                         let id = asset
-                            .as_chunk_item(Vc::upcast(chunking_context))
+                            .as_chunk_item(module_graph, Vc::upcast(chunking_context))
                             .id()
                             .await?;
 
@@ -243,12 +264,14 @@ impl CodeGenerateable for UrlAssetReference {
                         // runtime fn __turbopack_resolve_module_id_path__.
                         let url_segment_resolver = if rewrite_url_base.is_some() {
                             quote!(
-                                "__turbopack_require__($id)" as Expr,
+                                "$turbopack_require($id)" as Expr,
+                                turbopack_require: Expr = TURBOPACK_REQUIRE.into(),
                                 id: Expr = module_id_to_lit(&id),
                             )
                         } else {
                             quote!(
-                                "__turbopack_resolve_module_id_path__($id)" as Expr,
+                                "$turbopack_resolve_module_id_path($id)" as Expr,
+                                turbopack_resolve_module_id_path: Expr = TURBOPACK_RESOLVE_MODULE_ID_PATH.into(),
                                 id: Expr = module_id_to_lit(&id),
                             )
                         };
@@ -302,6 +325,6 @@ impl CodeGenerateable for UrlAssetReference {
             }
         };
 
-        Ok(CodeGeneration::visitors(visitors))
+        Ok(CodeGeneration::visitors(visitors).cell())
     }
 }

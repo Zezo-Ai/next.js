@@ -8,6 +8,7 @@ use turbopack_core::{
         ChunkingTypeOption,
     },
     module::Module,
+    module_graph::ModuleGraph,
     reference::ModuleReference,
     resolve::{ModulePart, ModuleResolveResult},
 };
@@ -19,6 +20,7 @@ use crate::{
     chunk::EcmascriptChunkPlaceable,
     code_gen::{CodeGenerateable, CodeGeneration},
     references::esm::base::ReferencedAsset,
+    runtime_functions::TURBOPACK_IMPORT,
     utils::module_id_to_lit,
 };
 
@@ -66,7 +68,7 @@ impl ModuleReference for EcmascriptModulePartReference {
         let module = if let Some(part) = self.part {
             match *part.await? {
                 ModulePart::Locals => {
-                    let Some(module) = ResolvedVc::try_downcast_type(self.module).await? else {
+                    let Some(module) = ResolvedVc::try_downcast_type(self.module) else {
                         bail!(
                             "Expected EcmascriptModuleAsset for a EcmascriptModulePartReference \
                              with ModulePart::Locals"
@@ -112,12 +114,13 @@ impl CodeGenerateable for EcmascriptModulePartReference {
     #[turbo_tasks::function]
     async fn code_generation(
         self: Vc<Self>,
+        module_graph: Vc<ModuleGraph>,
         chunking_context: Vc<Box<dyn ChunkingContext>>,
     ) -> Result<Vc<CodeGeneration>> {
         let referenced_asset = ReferencedAsset::from_resolve_result(self.resolve_reference());
         let referenced_asset = referenced_asset.await?;
         let ident = referenced_asset
-            .get_ident()
+            .get_ident(module_graph, chunking_context)
             .await?
             .context("part module reference should have an ident")?;
 
@@ -125,17 +128,19 @@ impl CodeGenerateable for EcmascriptModulePartReference {
             bail!("part module reference should have an module reference");
         };
         let id = module
-            .as_chunk_item(Vc::upcast(chunking_context))
+            .as_chunk_item(module_graph, Vc::upcast(chunking_context))
             .id()
             .await?;
 
         Ok(CodeGeneration::hoisted_stmt(
             ident.clone().into(),
             quote!(
-                "var $name = __turbopack_import__($id);" as Stmt,
+                "var $name = $turbopack_import($id);" as Stmt,
                 name = Ident::new(ident.clone().into(), DUMMY_SP, Default::default()),
+                turbopack_import: Expr = TURBOPACK_IMPORT.into(),
                 id: Expr = module_id_to_lit(&id),
             ),
-        ))
+        )
+        .cell())
     }
 }
